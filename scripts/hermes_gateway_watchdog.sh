@@ -110,7 +110,7 @@ check_cron_jobs() {
   [[ -f "$ERROR_LOG" ]] || return 0
 
   local recent_failures
-  recent_failures=$(tail -100 "$ERROR_LOG" | grep -c "cron.scheduler.*failed" || echo "0")
+  recent_failures=$(tail -100 "$ERROR_LOG" 2>/dev/null | grep -c "cron.scheduler.*failed")
 
   if (( recent_failures > 0 )); then
     log "detected $recent_failures cron job failures in recent logs"
