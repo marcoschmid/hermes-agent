@@ -101,7 +101,7 @@ count_recent_errors() {
 
   # Annahme: Log-Format enthält Timestamps — wenn nicht, nehme einfach letzte Zeilen
   local error_count
-  error_count=$(tail -200 "$ERROR_LOG" | grep -c "^ERROR" || echo "0")
+  error_count=$(tail -200 "$ERROR_LOG" 2>/dev/null | grep -c "^ERROR")
   echo "$error_count"
 }
 
