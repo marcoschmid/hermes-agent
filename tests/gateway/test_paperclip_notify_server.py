@@ -42,9 +42,19 @@ def test_resolve_target_env(monkeypatch):
     assert paperclip_notify_server._resolve_target(None) == "env-target"
 
 
-def test_resolve_target_returns_none_when_unset(monkeypatch):
+def test_resolve_target_falls_back_to_evm_chat_id(monkeypatch):
     monkeypatch.delenv("PAPERCLIP_NOTIFY_TARGET", raising=False)
-    assert paperclip_notify_server._resolve_target(None) is None
+    monkeypatch.setenv("EVM_TELEGRAM_CHAT_ID", "evm-chat-99")
+    assert paperclip_notify_server._resolve_target(None) == "evm-chat-99"
+
+
+def test_resolve_target_falls_back_to_default_chat_id(monkeypatch):
+    monkeypatch.delenv("PAPERCLIP_NOTIFY_TARGET", raising=False)
+    monkeypatch.delenv("EVM_TELEGRAM_CHAT_ID", raising=False)
+    assert (
+        paperclip_notify_server._resolve_target(None)
+        == paperclip_notify_server.DEFAULT_TELEGRAM_CHAT_ID
+    )
 
 
 def test_telegram_sender_invokes_safe_telegram_send(monkeypatch, tmp_path):

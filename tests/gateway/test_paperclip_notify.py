@@ -124,14 +124,14 @@ def test_missing_required_field_returns_422(client):
     assert client.sent == []
 
 
-def test_token_from_secrets_file(tmp_path, monkeypatch):
-    """If PAPERCLIP_NOTIFY_TOKEN unset, fall back to ~/.hermes/secrets/notify-token."""
+def test_token_from_secrets_file_via_hermes_home(tmp_path, monkeypatch):
+    """If PAPERCLIP_NOTIFY_TOKEN unset, fall back to $HERMES_HOME/secrets/notify-token."""
     monkeypatch.delenv("PAPERCLIP_NOTIFY_TOKEN", raising=False)
+    hermes_home = tmp_path / "alt-hermes"
+    (hermes_home / "secrets").mkdir(parents=True)
+    (hermes_home / "secrets" / "notify-token").write_text("filetoken123\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("PAPERCLIP_NOTIFY_DB", str(tmp_path / "d.db"))
-    secrets_dir = tmp_path / "home" / ".hermes" / "secrets"
-    secrets_dir.mkdir(parents=True)
-    (secrets_dir / "notify-token").write_text("filetoken123\n")
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
     sent: List[str] = []
     app = FastAPI()
@@ -144,4 +144,60 @@ def test_token_from_secrets_file(tmp_path, monkeypatch):
         headers={"Authorization": "Bearer filetoken123"},
     )
     assert r.status_code == 200
+    assert len(sent) == 1
+
+
+def test_dedupe_db_path_respects_hermes_home(tmp_path, monkeypatch):
+    """Default dedupe DB lives under $HERMES_HOME/cron/, not ~/.hermes/cron/."""
+    monkeypatch.delenv("PAPERCLIP_NOTIFY_DB", raising=False)
+    hermes_home = tmp_path / "alt-hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("PAPERCLIP_NOTIFY_TOKEN", "tkn")
+
+    sent: List[str] = []
+    app = FastAPI()
+    app.include_router(build_router(telegram_send=lambda m: sent.append(m)))
+    c = TestClient(app)
+    r = c.post(
+        "/paperclip/notify", json=payload(), headers={"Authorization": "Bearer tkn"}
+    )
+    assert r.status_code == 200
+    assert (hermes_home / "cron" / "paperclip_notify_dedupe.db").exists()
+
+
+def test_concurrent_identical_requests_dedupe_atomically(env, tmp_path):
+    """Two near-simultaneous identical alerts must produce exactly one Telegram send."""
+    import asyncio
+    import threading
+
+    sent: List[str] = []
+    send_started = threading.Event()
+    proceed = threading.Event()
+
+    def telegram_send(message: str) -> None:
+        # Block the first send long enough for a second request to race in.
+        sent.append(message)
+        send_started.set()
+        proceed.wait(timeout=2)
+
+    app = FastAPI()
+    app.include_router(build_router(telegram_send=telegram_send))
+    c = TestClient(app)
+    h = {"Authorization": "Bearer secret123"}
+    p = payload(previous_status="warn", status="warn", content_hash="race-h")
+
+    async def fire():
+        loop = asyncio.get_running_loop()
+        return await asyncio.gather(
+            loop.run_in_executor(None, lambda: c.post("/paperclip/notify", json=p, headers=h)),
+            loop.run_in_executor(None, lambda: c.post("/paperclip/notify", json=p, headers=h)),
+        )
+
+    proceed.set()  # don't actually block telegram_send in this test variant
+    r1, r2 = asyncio.run(fire())
+    assert {r1.status_code, r2.status_code} == {200}
+    bodies = sorted([r1.json(), r2.json()], key=lambda b: not b.get("sent", False))
+    assert bodies[0] == {"sent": True}
+    assert bodies[1] == {"sent": False, "deduped": True}
     assert len(sent) == 1

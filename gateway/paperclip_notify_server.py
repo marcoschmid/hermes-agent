@@ -42,10 +42,18 @@ DEFAULT_SENDER_SCRIPT = str(
 )
 
 
+DEFAULT_TELEGRAM_CHAT_ID = "128314698"
+
+
 def _resolve_target(explicit: Optional[str]) -> Optional[str]:
     if explicit:
         return explicit
-    return os.environ.get("PAPERCLIP_NOTIFY_TARGET")
+    target = os.environ.get("PAPERCLIP_NOTIFY_TARGET") or os.environ.get(
+        "EVM_TELEGRAM_CHAT_ID"
+    )
+    if target:
+        return target
+    return DEFAULT_TELEGRAM_CHAT_ID
 
 
 def _resolve_sender_script() -> str:
