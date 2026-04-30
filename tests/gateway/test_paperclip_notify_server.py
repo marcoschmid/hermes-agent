@@ -1,5 +1,6 @@
 """Tests for the standalone paperclip-notify uvicorn server wrapper."""
-from typing import List
+import os
+import subprocess
 
 from fastapi.testclient import TestClient
 
@@ -16,7 +17,7 @@ def test_health_endpoint(monkeypatch, tmp_path):
     assert r.json() == {"ok": True}
 
 
-def test_build_app_without_target_uses_log_sink(monkeypatch, tmp_path, caplog):
+def test_build_app_without_target_uses_log_sink(monkeypatch, tmp_path):
     monkeypatch.setenv("PAPERCLIP_NOTIFY_TOKEN", "tkn")
     monkeypatch.setenv("PAPERCLIP_NOTIFY_DB", str(tmp_path / "d.db"))
     app = paperclip_notify_server.build_app(target=None)
@@ -41,38 +42,72 @@ def test_resolve_target_env(monkeypatch):
     assert paperclip_notify_server._resolve_target(None) == "env-target"
 
 
-def test_resolve_target_falls_back_to_cron_config(monkeypatch):
+def test_resolve_target_returns_none_when_unset(monkeypatch):
     monkeypatch.delenv("PAPERCLIP_NOTIFY_TARGET", raising=False)
-    fake_cfg = {"cron": {"auto_delivery": {"target": "cfg-target"}}}
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_cfg)
-    assert paperclip_notify_server._resolve_target(None) == "cfg-target"
-
-
-def test_resolve_target_returns_none_when_nothing_set(monkeypatch):
-    monkeypatch.delenv("PAPERCLIP_NOTIFY_TARGET", raising=False)
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
     assert paperclip_notify_server._resolve_target(None) is None
 
 
-def test_telegram_sender_invokes_send_message_tool(monkeypatch):
-    captured: List[dict] = []
+def test_telegram_sender_invokes_safe_telegram_send(monkeypatch, tmp_path):
+    captured = {}
 
-    def fake_tool(args, **kw):
-        captured.append(args)
-        return '{"ok": true}'
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(cmd, 0, "ok", "")
 
-    monkeypatch.setattr("tools.send_message_tool.send_message_tool", fake_tool)
-    sender = paperclip_notify_server._make_telegram_sender("telegram:-1:7")
-    sender("hello world")
-    assert captured == [{"action": "send", "target": "telegram:-1:7", "message": "hello world"}]
+    fake_script = tmp_path / "safe_telegram_send.sh"
+    fake_script.write_text("#!/bin/sh\necho ok\n")
+    fake_script.chmod(0o755)
+
+    monkeypatch.setenv("PAPERCLIP_NOTIFY_SENDER", str(fake_script))
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    sender = paperclip_notify_server._make_telegram_sender("128314698")
+    sender("hello")
+
+    cmd = captured["cmd"]
+    assert cmd[0] == "bash"
+    assert cmd[1] == str(fake_script)
+    assert "--target" in cmd and "128314698" in cmd
+    assert "--message" in cmd and "hello" in cmd
+    assert "--context" in cmd and "paperclip-notify" in cmd
 
 
-def test_telegram_sender_logs_error_payload(monkeypatch, caplog):
-    def fake_tool(args, **kw):
-        return '{"error": "something failed"}'
+def test_telegram_sender_logs_nonzero_exit(monkeypatch, tmp_path, caplog):
+    fake_script = tmp_path / "safe_telegram_send.sh"
+    fake_script.write_text("#!/bin/sh\nexit 1\n")
+    fake_script.chmod(0o755)
+    monkeypatch.setenv("PAPERCLIP_NOTIFY_SENDER", str(fake_script))
 
-    monkeypatch.setattr("tools.send_message_tool.send_message_tool", fake_tool)
-    sender = paperclip_notify_server._make_telegram_sender("telegram:1")
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 7, "", "boom")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    sender = paperclip_notify_server._make_telegram_sender("128314698")
     with caplog.at_level("ERROR"):
         sender("msg")
-    assert any("something failed" in r.message for r in caplog.records)
+    assert any("rc=7" in r.message and "boom" in r.message for r in caplog.records)
+
+
+def test_telegram_sender_falls_back_when_script_missing(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv("PAPERCLIP_NOTIFY_SENDER", str(tmp_path / "does-not-exist.sh"))
+    with caplog.at_level("WARNING"):
+        sender = paperclip_notify_server._make_telegram_sender("128314698")
+    sender("msg")
+    assert any("sender script missing" in r.message for r in caplog.records)
+
+
+def test_telegram_sender_handles_timeout(monkeypatch, tmp_path, caplog):
+    fake_script = tmp_path / "safe_telegram_send.sh"
+    fake_script.write_text("#!/bin/sh\nsleep 60\n")
+    fake_script.chmod(0o755)
+    monkeypatch.setenv("PAPERCLIP_NOTIFY_SENDER", str(fake_script))
+
+    def boom(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, 20)
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    sender = paperclip_notify_server._make_telegram_sender("128314698")
+    with caplog.at_level("ERROR"):
+        sender("msg")
+    assert any("timed out" in r.message for r in caplog.records)

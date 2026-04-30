@@ -1,25 +1,34 @@
 """Standalone uvicorn server for /paperclip/notify.
 
 Runs as a tiny FastAPI app (default 127.0.0.1:8765) that paperclip's routine
-checks POST to. Forwards alerts to Telegram via the existing send_message_tool.
+checks POST to. Forwards alerts to Telegram by shelling out to
+safe_telegram_send.sh — the same script openclaw cron scripts already use.
+That keeps the notify server independent of the hermes gateway daemon and its
+config-loading machinery (the gateway-resident `send_message_tool` only works
+when the full platform stack has booted).
+
 Launched by LaunchAgent (`de.marcoschmid.hermes-paperclip-notify.plist`) so it
 stays alive independent of the hermes gateway and web UI.
 
 Run:
     python -m gateway.paperclip_notify_server
-        [--host 127.0.0.1] [--port 8765] [--target telegram:CHAT_ID]
+        [--host 127.0.0.1] [--port 8765] [--target CHAT_ID]
 
 Configuration (env, all optional):
-    PAPERCLIP_NOTIFY_HOST    bind host        (default 127.0.0.1)
-    PAPERCLIP_NOTIFY_PORT    bind port        (default 8765)
-    PAPERCLIP_NOTIFY_TARGET  Telegram target  (default telegram:CHAT_ID via cron config)
-    PAPERCLIP_NOTIFY_TOKEN   bearer token     (else ~/.hermes/secrets/notify-token)
-    PAPERCLIP_NOTIFY_DB      dedupe SQLite    (default ~/.hermes/cron/paperclip_notify_dedupe.db)
+    PAPERCLIP_NOTIFY_HOST     bind host         (default 127.0.0.1)
+    PAPERCLIP_NOTIFY_PORT     bind port         (default 8765)
+    PAPERCLIP_NOTIFY_TARGET   Telegram chat_id  (default EVM_TELEGRAM_CHAT_ID env or 128314698)
+    PAPERCLIP_NOTIFY_TOKEN    bearer token      (else ~/.hermes/secrets/notify-token)
+    PAPERCLIP_NOTIFY_DB       dedupe SQLite     (default ~/.hermes/cron/paperclip_notify_dedupe.db)
+    PAPERCLIP_NOTIFY_SENDER   absolute path to  safe_telegram_send.sh
+                              (default ~/.openclaw/workspace/scripts/safe_telegram_send.sh)
 """
 import argparse
-import json
 import logging
 import os
+import shlex
+import subprocess
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI
@@ -28,51 +37,76 @@ from gateway.paperclip_notify import build_router
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SENDER_SCRIPT = str(
+    Path.home() / ".openclaw/workspace/scripts/safe_telegram_send.sh"
+)
+
 
 def _resolve_target(explicit: Optional[str]) -> Optional[str]:
     if explicit:
         return explicit
-    env = os.environ.get("PAPERCLIP_NOTIFY_TARGET")
-    if env:
-        return env
-    try:
-        from hermes_cli.config import load_config
+    return os.environ.get("PAPERCLIP_NOTIFY_TARGET")
 
-        cfg = load_config() or {}
-        target = cfg.get("cron", {}).get("auto_delivery", {}).get("target")
-        if target:
-            return target
-    except Exception as e:
-        logger.warning("could not load cron auto_delivery target from config: %s", e)
-    return None
+
+def _resolve_sender_script() -> str:
+    return os.environ.get("PAPERCLIP_NOTIFY_SENDER", DEFAULT_SENDER_SCRIPT)
 
 
 def _make_telegram_sender(target: Optional[str]):
-    """Return callable(str)->None that delivers the message to the configured target.
+    """Return callable(str)->None that delivers the message to a Telegram chat.
 
-    Falls back to a logger-only sink when no target is configured so the webhook
-    still acks 200 instead of 500ing on every alert.
+    Routes through `safe_telegram_send.sh` so we inherit Marco's existing
+    bot-token/auth setup without booting the hermes gateway. If the script is
+    missing or the chat target is unset we degrade to a log-only sink: the
+    webhook still acks 200 so paperclip's routine-checks don't see false
+    failures.
     """
-    if not target:
-        logger.warning(
-            "no PAPERCLIP_NOTIFY_TARGET / cron.auto_delivery.target — alerts will only be logged"
-        )
+    sender_script = _resolve_sender_script()
+
+    if not target or not Path(sender_script).is_file():
+        if not target:
+            logger.warning(
+                "PAPERCLIP_NOTIFY_TARGET unset — alerts will only be logged"
+            )
+        else:
+            logger.warning(
+                "telegram sender script missing at %s — alerts will only be logged",
+                sender_script,
+            )
 
         def _sink(message: str) -> None:
-            logger.info("[paperclip-notify (no target)] %s", message)
+            logger.info("[paperclip-notify (no sender)] %s", message)
 
         return _sink
 
-    from tools.send_message_tool import send_message_tool
-
     def _send(message: str) -> None:
-        result = send_message_tool({"action": "send", "target": target, "message": message})
+        cmd = [
+            "bash",
+            sender_script,
+            "--target",
+            str(target),
+            "--context",
+            "paperclip-notify",
+            "--message",
+            message,
+        ]
         try:
-            parsed = json.loads(result) if isinstance(result, str) else result
-        except (TypeError, ValueError):
-            parsed = {"raw": result}
-        if isinstance(parsed, dict) and parsed.get("error"):
-            logger.error("paperclip notify Telegram send failed: %s", parsed["error"])
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("paperclip notify telegram send timed out: %s", shlex.join(cmd))
+            return
+        if result.returncode != 0:
+            logger.error(
+                "paperclip notify telegram send rc=%d stderr=%s",
+                result.returncode,
+                (result.stderr or "").strip()[:400],
+            )
 
     return _send
 
