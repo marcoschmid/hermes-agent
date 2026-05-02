@@ -13,7 +13,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
-from typing import Optional
+from typing import Any, Optional
 
 from agent.skill_utils import (
     extract_skill_conditions,
@@ -452,6 +452,51 @@ def build_environment_hints() -> str:
     if is_wsl():
         hints.append(WSL_ENVIRONMENT_HINT)
     return "\n\n".join(hints)
+
+
+def _env_truthy(name: str) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _render_resource_template(template: str, inputs: dict[str, Any]) -> str:
+    rendered = template
+    for key, value in inputs.items():
+        rendered = rendered.replace("{{" + str(key) + "}}", str(value))
+    return rendered
+
+
+def build_prompt_resource_context(
+    *,
+    workspace_root: str | None = None,
+    template_name: str | None = None,
+    persona: str | None = None,
+    inputs: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Build feature-flagged Jarvis prompt resource metadata."""
+    if not _env_truthy("JARVIS_PROMPT_RESOURCES"):
+        return "", None
+
+    from agent.jarvis_prompt_loader import load_prompt_resources
+    from agent.prompt_snapshot import build_prompt_snapshot
+
+    resolved_root = workspace_root or os.getenv("JARVIS_WORKSPACE_ROOT") or "/Users/marco/.openclaw/workspace"
+    resolved_template = template_name or os.getenv("JARVIS_PROMPT_TEMPLATE") or "task-execution"
+    resolved_persona = persona or os.getenv("JARVIS_PERSONA") or "jarvis"
+    resolved_inputs = dict(inputs or {})
+
+    resources = load_prompt_resources(resolved_root, resolved_template, persona=resolved_persona)
+    rendered_prompt = _render_resource_template(resources["template"], resolved_inputs)
+    snapshot = build_prompt_snapshot(resources, resolved_inputs, rendered_prompt)
+    frontmatter = resources["template_frontmatter"]
+    context = (
+        "# Jarvis Prompt Resources\n\n"
+        f"Template: {frontmatter.get('name')}@{frontmatter.get('version')}\n"
+        f"Persona: persona={resources.get('persona_name', resolved_persona)}\n"
+        f"Template Git SHA: {resources.get('template_git_sha') or 'unknown'}\n"
+        "Prompt snapshot metadata is sanitized before storage or logging."
+    )
+    return context, snapshot
 
 
 CONTEXT_FILE_MAX_CHARS = 20_000
