@@ -1,0 +1,10 @@
+name: media_pipe
+version: 1.0.0
+description: "Media Pipe tools for provider-neutral media quotes, approval-gated runs, status, and ledger access."
+author: OpenClaw
+kind: standalone
+provides_tools:
+  - media_pipe_quote
+  - media_pipe_run
+  - media_pipe_status
+  - media_pipe_ledger
