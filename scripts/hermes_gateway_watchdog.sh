@@ -6,6 +6,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
 # Config
 LAUNCHD_LABEL="${LAUNCHD_LABEL:-ai.hermes.gateway}"
+LAUNCHD_PLIST="${LAUNCHD_PLIST:-$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist}"
 ERROR_LOG="${ERROR_LOG:-$HOME/.hermes/logs/gateway.error.log}"
 GATEWAY_LOG="${GATEWAY_LOG:-$HOME/.hermes/logs/gateway.log}"
 STATE_FILE="${STATE_FILE:-$HOME/.openclaw/workspace/memory/ops/hermes-gateway-watchdog.json}"
@@ -86,9 +87,36 @@ escalate_to_task() {
 }
 
 check_process_running() {
-  local uid
-  uid="$(id -u)"
   launchctl list | grep -q "$LAUNCHD_LABEL"
+}
+
+restart_gateway() {
+  local uid target restart_out restart_rc bootstrap_out bootstrap_rc
+  uid="$(id -u)"
+  target="gui/$uid/$LAUNCHD_LABEL"
+
+  restart_out="$(launchctl kickstart -k "$target" 2>&1)"
+  restart_rc=$?
+  [[ -n "$restart_out" ]] && log "restart output: $restart_out"
+
+  if (( restart_rc == 0 )); then
+    return 0
+  fi
+
+  if [[ "$restart_out" == *"Could not find service"* && -f "$LAUNCHD_PLIST" ]]; then
+    log "gateway service missing from launchd; bootstrapping $LAUNCHD_PLIST"
+    bootstrap_out="$(launchctl bootstrap "gui/$uid" "$LAUNCHD_PLIST" 2>&1)"
+    bootstrap_rc=$?
+    [[ -n "$bootstrap_out" ]] && log "bootstrap output: $bootstrap_out"
+
+    if (( bootstrap_rc == 0 )); then
+      restart_out="$(launchctl kickstart -k "$target" 2>&1)"
+      restart_rc=$?
+      [[ -n "$restart_out" ]] && log "restart output after bootstrap: $restart_out"
+    fi
+  fi
+
+  return "$restart_rc"
 }
 
 count_recent_errors() {
@@ -197,10 +225,8 @@ if (( cfail >= FAIL_THRESHOLD )); then
   if (( age_ms >= RESTART_COOLDOWN_SEC * 1000 )); then
     log "restarting gateway (fails=$cfail, restarts_in_window=$restart_count)"
 
-    uid="$(id -u)"
-    restart_out="$(launchctl kickstart -k "gui/$uid/$LAUNCHD_LABEL" 2>&1)"
+    restart_gateway
     restart_rc=$?
-    [[ -n "$restart_out" ]] && log "restart output: $restart_out"
 
     if (( restart_rc == 0 )); then
       last_restart="$now_ms"
@@ -209,7 +235,7 @@ if (( cfail >= FAIL_THRESHOLD )); then
 
       # Alert nach N Restarts
       if (( restart_count >= ALERT_AFTER_RESTARTS )) && [[ "$alerted" != "true" ]]; then
-        local reason="Gateway instabil"
+        reason="Gateway instabil"
         if $error_rate_critical; then
           reason="High Error Rate ($error_count errors/min)"
         elif ! $cron_healthy; then
@@ -224,7 +250,7 @@ if (( cfail >= FAIL_THRESHOLD )); then
 
       # Escalate nach MAX_RESTARTS
       if (( restart_count >= ESCALATE_AFTER_RESTARTS )) && [[ "$escalated" != "true" ]]; then
-        local reason="$restart_count Restarts in ${MAX_RESTARTS_WINDOW}s"
+        reason="$restart_count Restarts in ${MAX_RESTARTS_WINDOW}s"
         if escalate_to_task "$reason" "$restart_count"; then
           escalated=true
           log "escalated to guard task after $restart_count restarts"
