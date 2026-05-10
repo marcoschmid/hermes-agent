@@ -50,18 +50,19 @@ def _get_bundled_dir() -> Path:
     return Path(__file__).parent.parent / "skills"
 
 
-def _read_manifest() -> Dict[str, str]:
+def _read_manifest(manifest_file: Path | None = None) -> Dict[str, str]:
     """
     Read the manifest as a dict of {skill_name: origin_hash}.
 
     Handles both v1 (plain names) and v2 (name:hash) formats.
     v1 entries get an empty hash string which triggers migration on next sync.
     """
-    if not MANIFEST_FILE.exists():
+    effective_manifest = Path(manifest_file) if manifest_file is not None else MANIFEST_FILE
+    if not effective_manifest.exists():
         return {}
     try:
         result = {}
-        for line in MANIFEST_FILE.read_text(encoding="utf-8").splitlines():
+        for line in effective_manifest.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -77,7 +78,7 @@ def _read_manifest() -> Dict[str, str]:
         return {}
 
 
-def _write_manifest(entries: Dict[str, str]):
+def _write_manifest(entries: Dict[str, str], manifest_file: Path | None = None):
     """Write the manifest file atomically in v2 format (name:hash).
 
     Uses a temp file + os.replace() to avoid corruption if the process
@@ -85,13 +86,14 @@ def _write_manifest(entries: Dict[str, str]):
     """
     import tempfile
 
-    MANIFEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    effective_manifest = Path(manifest_file) if manifest_file is not None else MANIFEST_FILE
+    effective_manifest.parent.mkdir(parents=True, exist_ok=True)
     data = "\n".join(f"{name}:{hash_val}" for name, hash_val in sorted(entries.items())) + "\n"
 
     try:
         fd, tmp_path = tempfile.mkstemp(
-            dir=str(MANIFEST_FILE.parent),
-            prefix=".bundled_manifest_",
+            dir=str(effective_manifest.parent),
+            prefix=f"{effective_manifest.name}_",
             suffix=".tmp",
         )
         try:
@@ -99,7 +101,7 @@ def _write_manifest(entries: Dict[str, str]):
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
-            atomic_replace(tmp_path, MANIFEST_FILE)
+            atomic_replace(tmp_path, effective_manifest)
         except BaseException:
             try:
                 os.unlink(tmp_path)
@@ -107,7 +109,7 @@ def _write_manifest(entries: Dict[str, str]):
                 pass
             raise
     except Exception as e:
-        logger.debug("Failed to write skills manifest %s: %s", MANIFEST_FILE, e, exc_info=True)
+        logger.debug("Failed to write skills manifest %s: %s", effective_manifest, e, exc_info=True)
 
 
 def _read_skill_name(skill_md: Path, fallback: str) -> str:
@@ -151,13 +153,32 @@ def _discover_bundled_skills(bundled_dir: Path) -> List[Tuple[str, Path]]:
     return skills
 
 
-def _compute_relative_dest(skill_dir: Path, bundled_dir: Path) -> Path:
+def _compute_relative_dest(
+    skill_dir: Path,
+    bundled_dir: Path,
+    target_dir: Path | None = None,
+) -> Path:
     """
     Compute the destination path in SKILLS_DIR preserving the category structure.
     e.g., bundled/skills/mlops/axolotl -> ~/.hermes/skills/mlops/axolotl
     """
     rel = skill_dir.relative_to(bundled_dir)
-    return SKILLS_DIR / rel
+    return (Path(target_dir) if target_dir is not None else SKILLS_DIR) / rel
+
+
+def _find_skill_dest_by_name(skill_name: str, target_dir: Path) -> Path | None:
+    """Find an installed skill directory by its SKILL.md name field."""
+    if not target_dir.exists():
+        return None
+
+    ignored_parts = {".git", ".github", ".hub"}
+    for skill_md in target_dir.rglob("SKILL.md"):
+        if ignored_parts.intersection(skill_md.parts):
+            continue
+        candidate_name = _read_skill_name(skill_md, skill_md.parent.name)
+        if candidate_name == skill_name:
+            return skill_md.parent
+    return None
 
 
 def _dir_hash(directory: Path) -> str:
@@ -174,23 +195,34 @@ def _dir_hash(directory: Path) -> str:
     return hasher.hexdigest()
 
 
-def sync_skills(quiet: bool = False) -> dict:
+def sync_skills(
+    quiet: bool = False,
+    source_dir: Path | str | None = None,
+    target_dir: Path | str | None = None,
+    manifest_file: Path | str | None = None,
+    remove_deleted: bool = False,
+) -> dict:
     """
-    Sync bundled skills into ~/.hermes/skills/ using the manifest.
+    Sync skills into ~/.hermes/skills/ using the manifest.
 
     Returns:
         dict with keys: copied (list), updated (list), skipped (int),
-                        user_modified (list), cleaned (list), total_bundled (int)
+                        user_modified (list), cleaned (list), removed (int),
+                        total_bundled (int)
     """
-    bundled_dir = _get_bundled_dir()
+    bundled_dir = Path(source_dir) if source_dir is not None else _get_bundled_dir()
+    skills_dir = Path(target_dir) if target_dir is not None else SKILLS_DIR
+    active_manifest = Path(manifest_file) if manifest_file is not None else MANIFEST_FILE
+
     if not bundled_dir.exists():
         return {
             "copied": [], "updated": [], "skipped": 0,
-            "user_modified": [], "cleaned": [], "total_bundled": 0,
+            "user_modified": [], "cleaned": [], "removed": 0,
+            "total_bundled": 0,
         }
 
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    manifest = _read_manifest()
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    manifest = _read_manifest(active_manifest)
     bundled_skills = _discover_bundled_skills(bundled_dir)
     bundled_names = {name for name, _ in bundled_skills}
 
@@ -198,9 +230,10 @@ def sync_skills(quiet: bool = False) -> dict:
     updated = []
     user_modified = []
     skipped = 0
+    removed = 0
 
     for skill_name, skill_src in bundled_skills:
-        dest = _compute_relative_dest(skill_src, bundled_dir)
+        dest = _compute_relative_dest(skill_src, bundled_dir, skills_dir)
         bundled_hash = _dir_hash(skill_src)
 
         if skill_name not in manifest:
@@ -290,15 +323,29 @@ def sync_skills(quiet: bool = False) -> dict:
             # ── In manifest but not on disk — user deleted it ──
             skipped += 1
 
-    # Clean stale manifest entries (skills removed from bundled dir)
-    cleaned = sorted(set(manifest.keys()) - bundled_names)
-    for name in cleaned:
+    # Clean stale manifest entries (skills removed from source dir).
+    # With remove_deleted=True, also delete only the manifest-tracked target skill.
+    cleaned = []
+    for name in sorted(set(manifest.keys()) - bundled_names):
+        if remove_deleted:
+            dest = _find_skill_dest_by_name(name, skills_dir)
+            if dest is not None and dest.exists():
+                try:
+                    if dest.is_dir() and not dest.is_symlink():
+                        shutil.rmtree(dest)
+                    else:
+                        dest.unlink()
+                    removed += 1
+                except (OSError, IOError) as e:
+                    logger.debug("Could not remove deleted source skill %s at %s: %s", name, dest, e)
+                    continue
         del manifest[name]
+        cleaned.append(name)
 
     # Also copy DESCRIPTION.md files for categories (if not already present)
     for desc_md in bundled_dir.rglob("DESCRIPTION.md"):
         rel = desc_md.relative_to(bundled_dir)
-        dest_desc = SKILLS_DIR / rel
+        dest_desc = skills_dir / rel
         if not dest_desc.exists():
             try:
                 dest_desc.parent.mkdir(parents=True, exist_ok=True)
@@ -306,7 +353,7 @@ def sync_skills(quiet: bool = False) -> dict:
             except (OSError, IOError) as e:
                 logger.debug("Could not copy %s: %s", desc_md, e)
 
-    _write_manifest(manifest)
+    _write_manifest(manifest, active_manifest)
 
     return {
         "copied": copied,
@@ -314,6 +361,7 @@ def sync_skills(quiet: bool = False) -> dict:
         "skipped": skipped,
         "user_modified": user_modified,
         "cleaned": cleaned,
+        "removed": removed,
         "total_bundled": len(bundled_skills),
     }
 
@@ -428,4 +476,6 @@ if __name__ == "__main__":
         parts.append(f"{len(result['user_modified'])} user-modified (kept)")
     if result["cleaned"]:
         parts.append(f"{len(result['cleaned'])} cleaned from manifest")
+    if result["removed"]:
+        parts.append(f"{result['removed']} removed")
     print(f"\nDone: {', '.join(parts)}. {result['total_bundled']} total bundled.")

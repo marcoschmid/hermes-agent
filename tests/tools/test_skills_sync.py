@@ -1,5 +1,6 @@
 """Tests for tools/skills_sync.py — manifest-based skill seeding and updating."""
 
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -487,7 +488,8 @@ class TestSyncSkills:
             result = sync_skills(quiet=True)
         assert result == {
             "copied": [], "updated": [], "skipped": 0,
-            "user_modified": [], "cleaned": [], "total_bundled": 0,
+            "user_modified": [], "cleaned": [], "removed": 0,
+            "total_bundled": 0,
         }
 
     def test_failed_copy_does_not_poison_manifest(self, tmp_path):
@@ -581,6 +583,159 @@ class TestSyncSkills:
         new_bundled_hash = _dir_hash(bundled / "old-skill")
         assert manifest["old-skill"] == new_bundled_hash
         assert manifest["old-skill"] != old_hash
+
+
+class TestSyncSkillsWorkspaceSource:
+    def _setup_workspace_source(self, tmp_path):
+        source = tmp_path / "workspace_skills"
+        (source / "automation" / "daily-brief").mkdir(parents=True)
+        (source / "automation" / "daily-brief" / "SKILL.md").write_text(
+            "---\nname: daily-brief\n---\n# Daily Brief\n"
+        )
+        (source / "automation" / "daily-brief" / "main.py").write_text("print('brief')\n")
+        (source / "writing" / "copy-polish").mkdir(parents=True)
+        (source / "writing" / "copy-polish" / "SKILL.md").write_text(
+            "---\nname: copy-polish\n---\n# Copy Polish\n"
+        )
+        return source
+
+    def test_workspace_style_source_syncs_to_custom_target(self, tmp_path):
+        source = self._setup_workspace_source(tmp_path)
+        target = tmp_path / "hermes_skills"
+        manifest_file = target / ".workspace_manifest"
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+        )
+
+        assert sorted(result["copied"]) == ["copy-polish", "daily-brief"]
+        assert result["removed"] == 0
+        assert (target / "automation" / "daily-brief" / "SKILL.md").exists()
+        assert (target / "writing" / "copy-polish" / "SKILL.md").exists()
+        manifest = _read_manifest(manifest_file)
+        assert set(manifest) == {"daily-brief", "copy-polish"}
+
+
+class TestSyncSkillsSeparateManifest:
+    def _setup_source(self, root, rel_path, name):
+        skill_dir = root / rel_path
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {name}\n")
+        return root
+
+    def test_bundled_and_workspace_manifests_do_not_overwrite_each_other(self, tmp_path):
+        from contextlib import ExitStack
+
+        bundled = self._setup_source(
+            tmp_path / "bundled_skills",
+            Path("core") / "bundled-only",
+            "bundled-only",
+        )
+        workspace = self._setup_source(
+            tmp_path / "workspace_skills",
+            Path("workspace") / "workspace-only",
+            "workspace-only",
+        )
+        target = tmp_path / "hermes_skills"
+        bundled_manifest = target / ".bundled_manifest"
+        workspace_manifest = target / ".workspace_manifest"
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+            stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", target))
+            stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", bundled_manifest))
+            bundled_result = sync_skills(quiet=True)
+
+        workspace_result = sync_skills(
+            quiet=True,
+            source_dir=workspace,
+            target_dir=target,
+            manifest_file=workspace_manifest,
+        )
+
+        assert bundled_result["copied"] == ["bundled-only"]
+        assert workspace_result["copied"] == ["workspace-only"]
+        assert set(_read_manifest(bundled_manifest)) == {"bundled-only"}
+        assert set(_read_manifest(workspace_manifest)) == {"workspace-only"}
+        assert (target / "core" / "bundled-only" / "SKILL.md").exists()
+        assert (target / "workspace" / "workspace-only" / "SKILL.md").exists()
+
+
+class TestSyncSkillsRemoveDeleted:
+    def _setup_source(self, tmp_path):
+        source = tmp_path / "workspace_skills"
+        skill_dir = source / "ops" / "cleanup"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: cleanup\n---\n# Cleanup\n")
+        return source
+
+    def test_remove_deleted_removes_target_and_manifest_entry(self, tmp_path):
+        source = self._setup_source(tmp_path)
+        target = tmp_path / "hermes_skills"
+        manifest_file = target / ".workspace_manifest"
+
+        sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+        )
+        shutil.rmtree(source / "ops" / "cleanup")
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+            remove_deleted=True,
+        )
+
+        assert result["removed"] == 1
+        assert "cleanup" in result["cleaned"]
+        assert not (target / "ops" / "cleanup").exists()
+        assert "cleanup" not in _read_manifest(manifest_file)
+
+
+class TestSyncSkillsManifestProtection:
+    def _setup_source(self, tmp_path):
+        source = tmp_path / "workspace_skills"
+        tracked = source / "tracked"
+        tracked.mkdir(parents=True)
+        (tracked / "SKILL.md").write_text("---\nname: tracked\n---\n# Tracked\n")
+        return source
+
+    def test_remove_deleted_only_removes_manifest_tracked_skills(self, tmp_path):
+        source = self._setup_source(tmp_path)
+        target = tmp_path / "hermes_skills"
+        manifest_file = target / ".workspace_manifest"
+
+        sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+        )
+
+        untracked = target / "untracked"
+        untracked.mkdir(parents=True)
+        (untracked / "SKILL.md").write_text("---\nname: untracked\n---\n# Keep Me\n")
+        shutil.rmtree(source / "tracked")
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+            remove_deleted=True,
+        )
+
+        assert result["removed"] == 1
+        assert not (target / "tracked").exists()
+        assert (target / "untracked" / "SKILL.md").exists()
+        assert _read_manifest(manifest_file) == {}
 
 
 class TestGetBundledDir:
