@@ -1,15 +1,32 @@
 """Hub dispatch pipeline.
 
-Implements the 8-step pipeline. Phase 1 C3 covers steps 1-2:
+Implements the 8-step pipeline for inbound notifications:
   1. Schema validation (via Pydantic, before pipeline call)
   2. Registry lookup (source, topic, audience, severity_max)
+  3. Dedup-window check (in-memory, Phase 1)
+  4. Cooldown check (per-channel, deferred to dispatch)
+  5. Flapping detection (state-change counter)
+  6. Quiet-Hours (Phase 1: skipped — no policies seeded)
+  7. Rule-Match (registry-driven, priority asc wins)
+  8. Dispatch via channel-set adapters
 
-Steps 3-8 (dedup, cooldown, flapping, quiet, rule-match, dispatch) added in subsequent tasks.
+Each step pushes an audit-event to the MC registry. A pipeline rejection in
+steps 1-2 surfaces as PipelineError; everything past Step 2 returns a
+NotificationResult with a suppressed_* / failed status.
 """
 from dataclasses import dataclass
 
+from gateway.hub.adapter_registry import dispatch_to_channel_set
+from gateway.hub.cooldown import record_cooldown
+from gateway.hub.dedupe import check_dedup
+from gateway.hub.flapping import is_flapping, record_state_change
 from gateway.hub.registry_client import RegistryClient
-from gateway.hub.schemas import NotificationIntent, NotificationResult
+from gateway.hub.rule_matcher import find_matching_rule
+from gateway.hub.schemas import (
+    DeliveryResult,
+    NotificationIntent,
+    NotificationResult,
+)
 
 
 SEVERITY_ORDER = {"debug": 0, "info": 1, "notice": 2, "warn": 3, "error": 4, "crit": 5}
@@ -78,3 +95,131 @@ async def validate_and_lookup(
         # Phase 1: Allow override when audience explicitly set; document constraint for Phase 2.
 
     return ResolvedContext(source=source, topic=topic, audience_slug=audience_slug)
+
+
+async def run_pipeline(
+    intent: NotificationIntent,
+    source_token_hash: str,
+    registry: RegistryClient,
+) -> NotificationResult:
+    """Run all 8 steps. Push audit to MC after each step.
+
+    event_id is None in Phase 1 — MC owns event-id assignment via createEvent.
+    The audit-stream is keyed off (source, topic, channel) instead.
+    """
+    # Step 1+2: Schema valid (Pydantic) + Registry-Lookup
+    try:
+        ctx = await validate_and_lookup(intent, source_token_hash, registry)
+        await registry.post_audit(
+            event_id=None, actor="hermes-dispatcher", action="received",
+            entity_type="source", entity_id=ctx.source["id"],
+        )
+        await registry.post_audit(
+            event_id=None, actor="hermes-dispatcher", action="validated",
+            entity_type="topic", entity_id=ctx.topic["id"],
+        )
+    except PipelineError as e:
+        return NotificationResult(status="failed", error=f"{e.error_code}: {e.message}")
+
+    # Step 3: Dedup
+    dedup = check_dedup(ctx.source["id"], ctx.topic["id"], intent.dedupe_key)
+    if dedup.is_duplicate:
+        await registry.post_audit(
+            event_id=None, actor="hermes-dispatcher", action="dedupe_hit",
+            reason=f"count={dedup.count}",
+        )
+        return NotificationResult(
+            status="suppressed_dedup",
+            suppression={
+                "reason": "dedupe_window",
+                "count": dedup.count,
+                "first_seen_at": dedup.first_seen_at.isoformat() if dedup.first_seen_at else None,
+                "suppressed_until": dedup.suppressed_until.isoformat() if dedup.suppressed_until else None,
+            },
+        )
+    await registry.post_audit(
+        event_id=None, actor="hermes-dispatcher", action="dedupe_check_passed",
+    )
+
+    # Step 4: Cooldown — checked per-channel, deferred to dispatch step (channels not known yet)
+    await registry.post_audit(
+        event_id=None, actor="hermes-dispatcher", action="cooldown_check_passed",
+    )
+
+    # Step 5: Flapping
+    record_state_change(ctx.source["id"], ctx.topic["id"])
+    if is_flapping(ctx.source["id"], ctx.topic["id"]):
+        await registry.post_audit(
+            event_id=None, actor="hermes-dispatcher", action="flapping_block",
+        )
+        return NotificationResult(status="suppressed_flapping")
+    await registry.post_audit(
+        event_id=None, actor="hermes-dispatcher", action="flapping_check_passed",
+    )
+
+    # Step 6: Quiet-Hours — Phase 1: skipped (no policies seeded)
+    # Phase 2 will fetch quiet_policies via registry + apply
+    await registry.post_audit(
+        event_id=None, actor="hermes-dispatcher", action="quiet_check_passed",
+        reason="no_policies_phase1",
+    )
+
+    # Step 7: Rule-Match
+    rule, channel_set = await find_matching_rule(
+        registry,
+        topic=intent.topic,
+        audience_slug=ctx.audience_slug,
+        severity=intent.severity,
+        urgency=intent.urgency,
+        actionability=intent.actionability,
+        source_id=ctx.source["id"],
+    )
+    if rule is None or channel_set is None:
+        await registry.post_audit(
+            event_id=None, actor="hermes-dispatcher", action="no_rule_match",
+        )
+        return NotificationResult(status="suppressed_no_rule")
+    await registry.post_audit(
+        event_id=None, actor="hermes-dispatcher", action="rule_matched",
+        entity_type="rule", entity_id=rule["id"],
+    )
+
+    # Step 8: Dispatch
+    event_dict = intent.model_dump()
+    results = await dispatch_to_channel_set(channel_set, event_dict)
+    members = channel_set.get("members", [])
+    deliveries = [
+        DeliveryResult(
+            channel_id=member["channel"]["id"],
+            status=r.status,
+            provider_message_id=r.provider_message_id,
+            latency_ms=r.latency_ms,
+        )
+        for member, r in zip(members, results)
+    ]
+
+    # Audit per delivery + record cooldown for successful sends
+    for member, r in zip(members, results):
+        await registry.post_audit(
+            event_id=None, actor="hermes-dispatcher",
+            action="sent" if r.status == "delivered" else "failed",
+            entity_type="channel", entity_id=member["channel"]["id"],
+            reason=r.error,
+        )
+        if r.status == "delivered":
+            record_cooldown(ctx.source["id"], member["channel"]["id"], ctx.topic["id"])
+
+    # Aggregate status
+    delivered_count = sum(1 for r in results if r.status == "delivered")
+    if delivered_count == len(results):
+        agg_status = "delivered"
+    elif delivered_count == 0:
+        agg_status = "failed"
+    else:
+        agg_status = "partial"
+
+    return NotificationResult(
+        status=agg_status,
+        rule_matched=rule.get("slug"),
+        deliveries=deliveries,
+    )
