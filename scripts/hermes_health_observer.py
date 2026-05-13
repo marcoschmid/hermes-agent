@@ -161,26 +161,53 @@ def _fire_fallback(
     limit: int,
     dry_run: bool,
 ) -> dict[str, Any]:
-    """Placeholder: enumerate eligible issues and POST fallback for each.
-
-    Real iteration requires a Paperclip endpoint to list 'issues with executor=hermes
-    assignment that have no active lock' which doesn't exist yet (TODO 4c-3 Wave 3).
-    For now we record what would happen but do nothing.
-    """
+    """Enumerate eligible issues via Paperclip and POST fallback for each."""
     if not os.environ.get("PAPERCLIP_API_TOKEN"):
         return {"fired": 0, "skipped": "no PAPERCLIP_API_TOKEN env var"}
+    company_id = os.environ.get("OBSERVER_COMPANY_ID")
+    if not company_id:
+        return {"fired": 0, "skipped": "no OBSERVER_COMPANY_ID env var"}
+
     try:
         client = PaperclipIssueRunsClient()
-        client.close()
     except IssueRunsClientError as exc:
         return {"fired": 0, "error": str(exc)}
 
+    try:
+        eligible = client.list_eligible_fallback_issues(company_id=company_id, limit=limit)
+    except IssueRunsClientError as exc:
+        client.close()
+        return {"fired": 0, "error": f"list eligible failed: {exc}"}
+
+    reason = f"hermes_{snapshot.state}_{int(snapshot.heartbeat_age_seconds or 0)}s"
+    outcomes: list[dict[str, Any]] = []
+    fired = 0
+    for issue in eligible[:limit]:
+        issue_id = issue.get("issueId")
+        if not issue_id:
+            continue
+        try:
+            result = client.fire_fallback(
+                company_id=company_id,
+                issue_id=issue_id,
+                reason=reason,
+                hermes_health_snapshot=snapshot.to_dict(),
+                dry_run=dry_run,
+            )
+            outcomes.append({"issueId": issue_id, "outcome": result.get("outcome")})
+            if result.get("accepted"):
+                fired += 1
+        except IssueRunsClientError as exc:
+            outcomes.append({"issueId": issue_id, "error": str(exc)})
+
+    client.close()
     return {
-        "fired": 0,
-        "skipped": "issue-enumeration endpoint not implemented yet (4c-3 wave 3)",
+        "fired": fired,
+        "evaluated": len(eligible),
         "limit": limit,
         "dry_run": dry_run,
         "snapshot": snapshot.to_dict(),
+        "outcomes": outcomes,
     }
 
 

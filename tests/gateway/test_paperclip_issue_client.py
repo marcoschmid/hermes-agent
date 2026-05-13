@@ -164,3 +164,90 @@ def test_auth_error_raises_client_error(client_factory):
     client = client_factory(handler)
     with pytest.raises(IssueRunsClientError, match="auth error"):
         client.heartbeat(run_id="run-1", locked_by="w1")
+
+
+def test_list_eligible_fallback_issues(client_factory):
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/api/internal/fallback/mc-dispatch/eligible-issues"
+        assert req.url.params.get("companyId") == "co-1"
+        assert req.url.params.get("limit") == "10"
+        return httpx.Response(
+            200,
+            json={
+                "companyId": "co-1",
+                "issues": [
+                    {"issueId": "iss-1", "assigneeAgentId": "a-1", "issueStatus": "todo"},
+                    {"issueId": "iss-2", "assigneeAgentId": "a-2", "issueStatus": "in_progress"},
+                ],
+            },
+        )
+
+    client = client_factory(handler)
+    issues = client.list_eligible_fallback_issues(company_id="co-1", limit=10)
+    assert len(issues) == 2
+    assert issues[0]["issueId"] == "iss-1"
+
+
+def test_list_eligible_fallback_empty(client_factory):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"companyId": "co-1", "issues": []})
+
+    client = client_factory(handler)
+    issues = client.list_eligible_fallback_issues(company_id="co-1")
+    assert issues == []
+
+
+def test_fire_fallback_accepted_dry_run(client_factory):
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/api/internal/fallback/mc-dispatch"
+        body = json.loads(req.content)
+        assert body["dryRun"] is True
+        assert body["fallbackFrom"] == "hermes"
+        return httpx.Response(
+            200,
+            json={
+                "accepted": True,
+                "mode": "mc-dispatch",
+                "outcome": "accepted-dry-run",
+                "legacyTaskId": None,
+                "issueRunId": None,
+                "warnings": [],
+            },
+        )
+
+    client = client_factory(handler)
+    result = client.fire_fallback(
+        company_id="co-1",
+        issue_id="iss-1",
+        reason="hermes_down_60s",
+        dry_run=True,
+    )
+    assert result["accepted"] is True
+    assert result["outcome"] == "accepted-dry-run"
+
+
+def test_fire_fallback_with_snapshot(client_factory):
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        assert body["hermesHealthSnapshot"]["state"] == "down"
+        return httpx.Response(
+            200,
+            json={
+                "accepted": True,
+                "mode": "mc-dispatch",
+                "outcome": "accepted-spawned",
+                "legacyTaskId": None,
+                "issueRunId": "run-1",
+                "warnings": [],
+            },
+        )
+
+    client = client_factory(handler)
+    result = client.fire_fallback(
+        company_id="co-1",
+        issue_id="iss-1",
+        reason="hermes_down_180s",
+        hermes_health_snapshot={"state": "down", "pid": None},
+        dry_run=False,
+    )
+    assert result["outcome"] == "accepted-spawned"

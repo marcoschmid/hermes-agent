@@ -163,6 +163,39 @@ class PaperclipIssueRunsClient:
         r = self._client.post("/api/internal/issue-runs/recover-stale", json=body)
         return _ok_json(r)
 
+    def list_eligible_fallback_issues(self, *, company_id: str, limit: int = 25) -> list[dict[str, Any]]:
+        r = self._client.get(
+            "/api/internal/fallback/mc-dispatch/eligible-issues",
+            params={"companyId": company_id, "limit": limit},
+        )
+        data = _ok_json(r)
+        issues = data.get("issues") if isinstance(data, dict) else None
+        return issues if isinstance(issues, list) else []
+
+    def fire_fallback(
+        self,
+        *,
+        company_id: str,
+        issue_id: str,
+        issue_run_id: Optional[str] = None,
+        reason: str,
+        hermes_health_snapshot: Optional[dict[str, Any]] = None,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "companyId": company_id,
+            "issueId": issue_id,
+            "fallbackFrom": "hermes",
+            "reason": reason,
+            "dryRun": dry_run,
+        }
+        if issue_run_id is not None:
+            body["issueRunId"] = issue_run_id
+        if hermes_health_snapshot is not None:
+            body["hermesHealthSnapshot"] = hermes_health_snapshot
+        r = self._client.post("/api/internal/fallback/mc-dispatch", json=body)
+        return _ok_json(r)
+
 
 def _ok_json(r: httpx.Response) -> dict[str, Any]:
     if r.status_code >= 500:
