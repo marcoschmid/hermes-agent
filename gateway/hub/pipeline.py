@@ -48,7 +48,9 @@ class ResolvedContext:
     """Resolved registry data after Step 2."""
     source: dict
     topic: dict
-    audience_slug: str  # final audience-slug after override-merge
+    audience_slug: str  # ALWAYS a bare slug (e.g. "marco"), never an aud_-id.
+    # MC's matchRules accepts both, but we keep the slug semantics here so the
+    # cache-key in registry_client stays slug-stable across senders.
 
 
 async def validate_and_lookup(
@@ -78,21 +80,27 @@ async def validate_and_lookup(
     if topic is None:
         raise PipelineError(404, "topic_not_found", f"Unknown topic: {intent.topic}")
 
-    # Step 2d: Audience-Resolution + Match
+    # Step 2d: Audience-Resolution — ALWAYS produces a bare slug.
+    #
+    # `intent.audience` is a slug per schema (e.g. "family"). The topic
+    # endpoint now joins audiences and surfaces `default_audience_slug`
+    # alongside `default_audience_id`, so we can fall back without a
+    # second registry round-trip. Falling back to `default_audience_id`
+    # would push an aud_-prefixed string through the rest of the
+    # pipeline, which used to surface as `suppressed_no_rule` because
+    # MC's rule-store is keyed on slug-resolved audience-ids.
     intent_audience = intent.audience  # may be None → fall back to topic default
-    topic_default_audience_id = topic.get("default_audience_id")
-
-    if intent_audience is None:
-        if not topic_default_audience_id:
-            raise PipelineError(400, "audience_missing", "No audience specified and topic has no default")
-        # We cannot resolve id→slug without another lookup — for now use the id as the resolved value
-        # For now: assume topic.default_audience_id matches an aud_<slug> id pattern
-        # Actual slug-resolution: caller can use audience.id directly downstream
-        audience_slug = topic_default_audience_id  # caller resolves
-    else:
+    if intent_audience is not None:
         audience_slug = intent_audience
-        # Hard validation: if topic has a default_audience_id, the override must match (Phase 2 may relax this)
-        # Phase 1: Allow override when audience explicitly set; document constraint for Phase 2.
+    else:
+        topic_default_audience_slug = topic.get("default_audience_slug")
+        if not topic_default_audience_slug:
+            raise PipelineError(
+                400,
+                "audience_missing",
+                "No audience specified and topic has no default",
+            )
+        audience_slug = topic_default_audience_slug
 
     return ResolvedContext(source=source, topic=topic, audience_slug=audience_slug)
 

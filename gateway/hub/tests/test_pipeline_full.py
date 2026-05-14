@@ -95,6 +95,7 @@ def make_topic(**overrides) -> dict:
         "id": "top_1",
         "slug": "ops.deploy",
         "default_audience_id": "aud_marco",
+        "default_audience_slug": "marco",
     }
     defaults.update(overrides)
     return defaults
