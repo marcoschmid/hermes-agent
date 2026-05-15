@@ -256,11 +256,25 @@ def sync_skills(
     copied = []
     updated = []
     user_modified = []
+    rejected = []
     skipped = 0
     removed = 0
 
     for skill_name, skill_src in bundled_skills:
         dest = _compute_relative_dest(skill_src, bundled_dir, skills_dir)
+        # GAP-1: validate the source BEFORE computing _dir_hash. Hashing reads
+        # file bytes through symlinks (fpath.read_bytes() follows them), which
+        # would leak external content into RAM and into the manifest hash even
+        # if the copy is later rejected. Reject up front.
+        if not _skill_source_safe(skill_src, bundled_dir):
+            rejected.append(skill_name)
+            if not quiet:
+                print(f"  ⚠ {skill_name}: source contains symlink escaping workspace — skipped")
+            logger.warning(
+                "skills-sync rejected %s before hash: symlink escape from %s outside %s",
+                skill_name, skill_src, bundled_dir,
+            )
+            continue
         bundled_hash = _dir_hash(skill_src)
 
         if skill_name not in manifest:
@@ -287,15 +301,6 @@ def sync_skills(
                             f"to replace it with the bundled version."
                         )
                 else:
-                    if not _skill_source_safe(skill_src, bundled_dir):
-                        skipped += 1
-                        if not quiet:
-                            print(f"  ⚠ {skill_name}: source contains symlink escaping workspace — skipped")
-                        logger.warning(
-                            "skills-sync rejected %s: symlink escape from %s outside %s",
-                            skill_name, skill_src, bundled_dir,
-                        )
-                        continue
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copytree(skill_src, dest, symlinks=True)
                     copied.append(skill_name)
@@ -332,15 +337,6 @@ def sync_skills(
 
             # User copy matches origin — check if bundled has a newer version
             if bundled_hash != origin_hash:
-                if not _skill_source_safe(skill_src, bundled_dir):
-                    user_modified.append(skill_name)
-                    if not quiet:
-                        print(f"  ⚠ {skill_name}: source contains symlink escaping workspace — skipped")
-                    logger.warning(
-                        "skills-sync rejected update for %s: symlink escape from %s outside %s",
-                        skill_name, skill_src, bundled_dir,
-                    )
-                    continue
                 try:
                     # Move old copy to a backup so we can restore on failure
                     backup = dest.with_suffix(".bak")
@@ -414,6 +410,8 @@ def sync_skills(
         "user_modified": user_modified,
         "cleaned": cleaned,
         "removed": removed,
+        "rejected": rejected,
+        "validation_errors": rejected,  # alias for watcher log forward-compat
         "total_bundled": len(bundled_skills),
     }
 

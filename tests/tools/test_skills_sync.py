@@ -925,7 +925,7 @@ class TestSymlinkEscapeRejection:
         )
         # Initial copy must NOT happen
         assert "safe-skill" not in result["copied"]
-        assert result["skipped"] >= 1
+        assert "safe-skill" in result["rejected"]
         # Target dir must NOT contain the skill, since the entire copy was refused
         assert not (skills_dir / "ops" / "safe-skill").exists()
 
@@ -979,3 +979,51 @@ class TestSymlinkEscapeRejection:
         assert (skills_dir / "ops" / "safe-skill" / "SKILL.md").exists()
         # symlink preserved (not dereferenced) — points at original
         assert (skills_dir / "ops" / "safe-skill" / "asset.txt").is_symlink()
+
+
+# ===== GAP-1: _dir_hash MUST NOT be called on bad sources =====
+
+class TestNoHashOnRejected:
+    """GAP-1 regression: validate source BEFORE _dir_hash to avoid leaking
+    external file content through hashing's read_bytes()."""
+
+    def test_dir_hash_not_called_on_rejected_skill(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        category = workspace / "ops"
+        category.mkdir()
+        skill = category / "leaky"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: leaky\n---\n")
+        # Place an escaping symlink pointing to a "secret" file outside workspace
+        secret = tmp_path / "secret.txt"
+        secret.write_text("SECRET-CONTENT-NEVER-READ")
+        (skill / "leak.txt").symlink_to(secret)
+
+        skills_dir = tmp_path / "target"
+        manifest = skills_dir / ".bundled_manifest"
+
+        # Spy on _dir_hash so we can assert it isn't invoked for the bad source
+        from tools import skills_sync as ss
+        calls: list[Path] = []
+        original_dir_hash = ss._dir_hash
+
+        def spy(path: Path) -> str:
+            calls.append(Path(path))
+            return original_dir_hash(path)
+
+        with patch.object(ss, "_dir_hash", side_effect=spy):
+            result = ss.sync_skills(
+                quiet=True,
+                source_dir=workspace,
+                target_dir=skills_dir,
+                manifest_file=manifest,
+            )
+
+        assert "leaky" in result["rejected"]
+        # _dir_hash MUST NOT have been called against the leaky skill source
+        for called in calls:
+            assert called != skill, (
+                f"_dir_hash was called on rejected skill at {skill}, which would "
+                f"have read the symlinked secret content via read_bytes()."
+            )
