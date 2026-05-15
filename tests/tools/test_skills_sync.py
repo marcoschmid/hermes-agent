@@ -1,5 +1,6 @@
 """Tests for tools/skills_sync.py — manifest-based skill seeding and updating."""
 
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -487,7 +488,9 @@ class TestSyncSkills:
             result = sync_skills(quiet=True)
         assert result == {
             "copied": [], "updated": [], "skipped": 0,
-            "user_modified": [], "cleaned": [], "total_bundled": 0,
+            "user_modified": [], "cleaned": [], "removed": 0,
+            "rejected": [], "validation_errors": [],
+            "total_bundled": 0,
         }
 
     def test_failed_copy_does_not_poison_manifest(self, tmp_path):
@@ -581,6 +584,159 @@ class TestSyncSkills:
         new_bundled_hash = _dir_hash(bundled / "old-skill")
         assert manifest["old-skill"] == new_bundled_hash
         assert manifest["old-skill"] != old_hash
+
+
+class TestSyncSkillsWorkspaceSource:
+    def _setup_workspace_source(self, tmp_path):
+        source = tmp_path / "workspace_skills"
+        (source / "automation" / "daily-brief").mkdir(parents=True)
+        (source / "automation" / "daily-brief" / "SKILL.md").write_text(
+            "---\nname: daily-brief\n---\n# Daily Brief\n"
+        )
+        (source / "automation" / "daily-brief" / "main.py").write_text("print('brief')\n")
+        (source / "writing" / "copy-polish").mkdir(parents=True)
+        (source / "writing" / "copy-polish" / "SKILL.md").write_text(
+            "---\nname: copy-polish\n---\n# Copy Polish\n"
+        )
+        return source
+
+    def test_workspace_style_source_syncs_to_custom_target(self, tmp_path):
+        source = self._setup_workspace_source(tmp_path)
+        target = tmp_path / "hermes_skills"
+        manifest_file = target / ".workspace_manifest"
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+        )
+
+        assert sorted(result["copied"]) == ["copy-polish", "daily-brief"]
+        assert result["removed"] == 0
+        assert (target / "automation" / "daily-brief" / "SKILL.md").exists()
+        assert (target / "writing" / "copy-polish" / "SKILL.md").exists()
+        manifest = _read_manifest(manifest_file)
+        assert set(manifest) == {"daily-brief", "copy-polish"}
+
+
+class TestSyncSkillsSeparateManifest:
+    def _setup_source(self, root, rel_path, name):
+        skill_dir = root / rel_path
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {name}\n")
+        return root
+
+    def test_bundled_and_workspace_manifests_do_not_overwrite_each_other(self, tmp_path):
+        from contextlib import ExitStack
+
+        bundled = self._setup_source(
+            tmp_path / "bundled_skills",
+            Path("core") / "bundled-only",
+            "bundled-only",
+        )
+        workspace = self._setup_source(
+            tmp_path / "workspace_skills",
+            Path("workspace") / "workspace-only",
+            "workspace-only",
+        )
+        target = tmp_path / "hermes_skills"
+        bundled_manifest = target / ".bundled_manifest"
+        workspace_manifest = target / ".workspace_manifest"
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+            stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", target))
+            stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", bundled_manifest))
+            bundled_result = sync_skills(quiet=True)
+
+        workspace_result = sync_skills(
+            quiet=True,
+            source_dir=workspace,
+            target_dir=target,
+            manifest_file=workspace_manifest,
+        )
+
+        assert bundled_result["copied"] == ["bundled-only"]
+        assert workspace_result["copied"] == ["workspace-only"]
+        assert set(_read_manifest(bundled_manifest)) == {"bundled-only"}
+        assert set(_read_manifest(workspace_manifest)) == {"workspace-only"}
+        assert (target / "core" / "bundled-only" / "SKILL.md").exists()
+        assert (target / "workspace" / "workspace-only" / "SKILL.md").exists()
+
+
+class TestSyncSkillsRemoveDeleted:
+    def _setup_source(self, tmp_path):
+        source = tmp_path / "workspace_skills"
+        skill_dir = source / "ops" / "cleanup"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: cleanup\n---\n# Cleanup\n")
+        return source
+
+    def test_remove_deleted_removes_target_and_manifest_entry(self, tmp_path):
+        source = self._setup_source(tmp_path)
+        target = tmp_path / "hermes_skills"
+        manifest_file = target / ".workspace_manifest"
+
+        sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+        )
+        shutil.rmtree(source / "ops" / "cleanup")
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+            remove_deleted=True,
+        )
+
+        assert result["removed"] == 1
+        assert "cleanup" in result["cleaned"]
+        assert not (target / "ops" / "cleanup").exists()
+        assert "cleanup" not in _read_manifest(manifest_file)
+
+
+class TestSyncSkillsManifestProtection:
+    def _setup_source(self, tmp_path):
+        source = tmp_path / "workspace_skills"
+        tracked = source / "tracked"
+        tracked.mkdir(parents=True)
+        (tracked / "SKILL.md").write_text("---\nname: tracked\n---\n# Tracked\n")
+        return source
+
+    def test_remove_deleted_only_removes_manifest_tracked_skills(self, tmp_path):
+        source = self._setup_source(tmp_path)
+        target = tmp_path / "hermes_skills"
+        manifest_file = target / ".workspace_manifest"
+
+        sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+        )
+
+        untracked = target / "untracked"
+        untracked.mkdir(parents=True)
+        (untracked / "SKILL.md").write_text("---\nname: untracked\n---\n# Keep Me\n")
+        shutil.rmtree(source / "tracked")
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+            remove_deleted=True,
+        )
+
+        assert result["removed"] == 1
+        assert not (target / "tracked").exists()
+        assert (target / "untracked" / "SKILL.md").exists()
+        assert _read_manifest(manifest_file) == {}
 
 
 class TestGetBundledDir:
@@ -732,3 +888,143 @@ class TestResetBundledSkill:
             post_manifest = _read_manifest()
             assert "google-workspace" in post_manifest
         assert (skills_dir / "productivity" / "google-workspace" / "SKILL.md").exists()
+
+
+# ===== C-1: Symlink-escape rejection =====
+
+class TestSymlinkEscapeRejection:
+    """Ensure workspace sources containing symlinks to outside the source root
+    are rejected — copy and update paths must not exfiltrate or import data
+    from /etc, $HOME, or any path outside the workspace skills dir."""
+
+    def _setup_workspace(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        category = workspace / "ops"
+        category.mkdir()
+        skill = category / "safe-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: safe-skill\n---\n# Safe\n")
+        return workspace, skill
+
+    def test_skill_with_symlink_escaping_workspace_is_rejected_on_initial_copy(self, tmp_path):
+        workspace, skill = self._setup_workspace(tmp_path)
+        # Bad-target lives entirely OUTSIDE workspace
+        secret = tmp_path / "outside-secret"
+        secret.write_text("OUTSIDE-DATA-LEAK")
+        # Place malicious symlink inside skill
+        (skill / "leaked.txt").symlink_to(secret)
+
+        skills_dir = tmp_path / "target"
+        manifest = skills_dir / ".bundled_manifest"
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=workspace,
+            target_dir=skills_dir,
+            manifest_file=manifest,
+        )
+        # Initial copy must NOT happen
+        assert "safe-skill" not in result["copied"]
+        assert "safe-skill" in result["rejected"]
+        # Target dir must NOT contain the skill, since the entire copy was refused
+        assert not (skills_dir / "ops" / "safe-skill").exists()
+
+    def test_skill_with_symlink_escaping_workspace_is_rejected_on_update(self, tmp_path):
+        workspace, skill = self._setup_workspace(tmp_path)
+        skills_dir = tmp_path / "target"
+        manifest = skills_dir / ".bundled_manifest"
+
+        # First sync (clean) succeeds
+        sync_skills(
+            quiet=True, source_dir=workspace, target_dir=skills_dir,
+            manifest_file=manifest,
+        )
+        assert (skills_dir / "ops" / "safe-skill" / "SKILL.md").exists()
+
+        # Modify the source to trigger update path AND add bad symlink
+        (skill / "SKILL.md").write_text("---\nname: safe-skill\n---\n# v2\n")
+        secret = tmp_path / "outside-secret-v2"
+        secret.write_text("OUTSIDE-DATA-LEAK-V2")
+        (skill / "leaked.txt").symlink_to(secret)
+
+        result = sync_skills(
+            quiet=True, source_dir=workspace, target_dir=skills_dir,
+            manifest_file=manifest,
+        )
+        # Update must NOT happen
+        assert "safe-skill" not in result["updated"]
+        # Target must not contain the malicious symlink
+        assert not (skills_dir / "ops" / "safe-skill" / "leaked.txt").exists()
+        # And must not contain the leaked content via dereferenced copy
+        for path in (skills_dir / "ops" / "safe-skill").rglob("*"):
+            if path.is_file():
+                assert "OUTSIDE-DATA-LEAK" not in path.read_text(errors="ignore")
+
+    def test_skill_with_internal_symlink_is_accepted(self, tmp_path):
+        """Symlinks that stay inside the workspace should be allowed (not escape)."""
+        workspace, skill = self._setup_workspace(tmp_path)
+        # Internal sibling target inside workspace
+        internal = workspace / "ops" / "shared-asset.txt"
+        internal.write_text("shared")
+        (skill / "asset.txt").symlink_to(internal)
+
+        skills_dir = tmp_path / "target"
+        manifest = skills_dir / ".bundled_manifest"
+
+        result = sync_skills(
+            quiet=True, source_dir=workspace, target_dir=skills_dir,
+            manifest_file=manifest,
+        )
+        assert "safe-skill" in result["copied"]
+        assert (skills_dir / "ops" / "safe-skill" / "SKILL.md").exists()
+        # symlink preserved (not dereferenced) — points at original
+        assert (skills_dir / "ops" / "safe-skill" / "asset.txt").is_symlink()
+
+
+# ===== GAP-1: _dir_hash MUST NOT be called on bad sources =====
+
+class TestNoHashOnRejected:
+    """GAP-1 regression: validate source BEFORE _dir_hash to avoid leaking
+    external file content through hashing's read_bytes()."""
+
+    def test_dir_hash_not_called_on_rejected_skill(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        category = workspace / "ops"
+        category.mkdir()
+        skill = category / "leaky"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: leaky\n---\n")
+        # Place an escaping symlink pointing to a "secret" file outside workspace
+        secret = tmp_path / "secret.txt"
+        secret.write_text("SECRET-CONTENT-NEVER-READ")
+        (skill / "leak.txt").symlink_to(secret)
+
+        skills_dir = tmp_path / "target"
+        manifest = skills_dir / ".bundled_manifest"
+
+        # Spy on _dir_hash so we can assert it isn't invoked for the bad source
+        from tools import skills_sync as ss
+        calls: list[Path] = []
+        original_dir_hash = ss._dir_hash
+
+        def spy(path: Path) -> str:
+            calls.append(Path(path))
+            return original_dir_hash(path)
+
+        with patch.object(ss, "_dir_hash", side_effect=spy):
+            result = ss.sync_skills(
+                quiet=True,
+                source_dir=workspace,
+                target_dir=skills_dir,
+                manifest_file=manifest,
+            )
+
+        assert "leaky" in result["rejected"]
+        # _dir_hash MUST NOT have been called against the leaky skill source
+        for called in calls:
+            assert called != skill, (
+                f"_dir_hash was called on rejected skill at {skill}, which would "
+                f"have read the symlinked secret content via read_bytes()."
+            )
