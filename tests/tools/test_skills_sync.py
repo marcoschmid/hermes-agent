@@ -887,3 +887,95 @@ class TestResetBundledSkill:
             post_manifest = _read_manifest()
             assert "google-workspace" in post_manifest
         assert (skills_dir / "productivity" / "google-workspace" / "SKILL.md").exists()
+
+
+# ===== C-1: Symlink-escape rejection =====
+
+class TestSymlinkEscapeRejection:
+    """Ensure workspace sources containing symlinks to outside the source root
+    are rejected — copy and update paths must not exfiltrate or import data
+    from /etc, $HOME, or any path outside the workspace skills dir."""
+
+    def _setup_workspace(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        category = workspace / "ops"
+        category.mkdir()
+        skill = category / "safe-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: safe-skill\n---\n# Safe\n")
+        return workspace, skill
+
+    def test_skill_with_symlink_escaping_workspace_is_rejected_on_initial_copy(self, tmp_path):
+        workspace, skill = self._setup_workspace(tmp_path)
+        # Bad-target lives entirely OUTSIDE workspace
+        secret = tmp_path / "outside-secret"
+        secret.write_text("OUTSIDE-DATA-LEAK")
+        # Place malicious symlink inside skill
+        (skill / "leaked.txt").symlink_to(secret)
+
+        skills_dir = tmp_path / "target"
+        manifest = skills_dir / ".bundled_manifest"
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=workspace,
+            target_dir=skills_dir,
+            manifest_file=manifest,
+        )
+        # Initial copy must NOT happen
+        assert "safe-skill" not in result["copied"]
+        assert result["skipped"] >= 1
+        # Target dir must NOT contain the skill, since the entire copy was refused
+        assert not (skills_dir / "ops" / "safe-skill").exists()
+
+    def test_skill_with_symlink_escaping_workspace_is_rejected_on_update(self, tmp_path):
+        workspace, skill = self._setup_workspace(tmp_path)
+        skills_dir = tmp_path / "target"
+        manifest = skills_dir / ".bundled_manifest"
+
+        # First sync (clean) succeeds
+        sync_skills(
+            quiet=True, source_dir=workspace, target_dir=skills_dir,
+            manifest_file=manifest,
+        )
+        assert (skills_dir / "ops" / "safe-skill" / "SKILL.md").exists()
+
+        # Modify the source to trigger update path AND add bad symlink
+        (skill / "SKILL.md").write_text("---\nname: safe-skill\n---\n# v2\n")
+        secret = tmp_path / "outside-secret-v2"
+        secret.write_text("OUTSIDE-DATA-LEAK-V2")
+        (skill / "leaked.txt").symlink_to(secret)
+
+        result = sync_skills(
+            quiet=True, source_dir=workspace, target_dir=skills_dir,
+            manifest_file=manifest,
+        )
+        # Update must NOT happen
+        assert "safe-skill" not in result["updated"]
+        # Target must not contain the malicious symlink
+        assert not (skills_dir / "ops" / "safe-skill" / "leaked.txt").exists()
+        # And must not contain the leaked content via dereferenced copy
+        for path in (skills_dir / "ops" / "safe-skill").rglob("*"):
+            if path.is_file():
+                assert "OUTSIDE-DATA-LEAK" not in path.read_text(errors="ignore")
+
+    def test_skill_with_internal_symlink_is_accepted(self, tmp_path):
+        """Symlinks that stay inside the workspace should be allowed (not escape)."""
+        workspace, skill = self._setup_workspace(tmp_path)
+        # Internal sibling target inside workspace
+        internal = workspace / "ops" / "shared-asset.txt"
+        internal.write_text("shared")
+        (skill / "asset.txt").symlink_to(internal)
+
+        skills_dir = tmp_path / "target"
+        manifest = skills_dir / ".bundled_manifest"
+
+        result = sync_skills(
+            quiet=True, source_dir=workspace, target_dir=skills_dir,
+            manifest_file=manifest,
+        )
+        assert "safe-skill" in result["copied"]
+        assert (skills_dir / "ops" / "safe-skill" / "SKILL.md").exists()
+        # symlink preserved (not dereferenced) — points at original
+        assert (skills_dir / "ops" / "safe-skill" / "asset.txt").is_symlink()

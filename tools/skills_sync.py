@@ -30,6 +30,11 @@ from hermes_constants import get_hermes_home
 from typing import Dict, List, Tuple
 from utils import atomic_replace
 
+try:
+    from tools.path_security import validate_within_dir
+except ImportError:
+    from path_security import validate_within_dir
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +53,28 @@ def _get_bundled_dir() -> Path:
     if env_override:
         return Path(env_override)
     return Path(__file__).parent.parent / "skills"
+
+
+def _skill_source_safe(skill_src: Path, source_root: Path) -> bool:
+    """Return True iff every path inside *skill_src* resolves under *source_root*.
+
+    Walks the skill directory and follows each symlink target to ensure it
+    does not escape the workspace boundary. Required because ``shutil.copytree``
+    defaults to ``symlinks=False`` (deref + copy target) and even with
+    ``symlinks=True`` (preserve), the preserved symlinks would let Hermes
+    runtime read out-of-tree files later.
+    """
+    try:
+        root_resolved = source_root.resolve()
+    except OSError:
+        return False
+    for path in [skill_src, *skill_src.rglob("*")]:
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(root_resolved)
+        except (ValueError, OSError):
+            return False
+    return True
 
 
 def _read_manifest(manifest_file: Path | None = None) -> Dict[str, str]:
@@ -260,8 +287,17 @@ def sync_skills(
                             f"to replace it with the bundled version."
                         )
                 else:
+                    if not _skill_source_safe(skill_src, bundled_dir):
+                        skipped += 1
+                        if not quiet:
+                            print(f"  ⚠ {skill_name}: source contains symlink escaping workspace — skipped")
+                        logger.warning(
+                            "skills-sync rejected %s: symlink escape from %s outside %s",
+                            skill_name, skill_src, bundled_dir,
+                        )
+                        continue
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copytree(skill_src, dest)
+                    shutil.copytree(skill_src, dest, symlinks=True)
                     copied.append(skill_name)
                     manifest[skill_name] = bundled_hash
                     if not quiet:
@@ -296,12 +332,21 @@ def sync_skills(
 
             # User copy matches origin — check if bundled has a newer version
             if bundled_hash != origin_hash:
+                if not _skill_source_safe(skill_src, bundled_dir):
+                    user_modified.append(skill_name)
+                    if not quiet:
+                        print(f"  ⚠ {skill_name}: source contains symlink escaping workspace — skipped")
+                    logger.warning(
+                        "skills-sync rejected update for %s: symlink escape from %s outside %s",
+                        skill_name, skill_src, bundled_dir,
+                    )
+                    continue
                 try:
                     # Move old copy to a backup so we can restore on failure
                     backup = dest.with_suffix(".bak")
                     shutil.move(str(dest), str(backup))
                     try:
-                        shutil.copytree(skill_src, dest)
+                        shutil.copytree(skill_src, dest, symlinks=True)
                         manifest[skill_name] = bundled_hash
                         updated.append(skill_name)
                         if not quiet:
@@ -330,6 +375,13 @@ def sync_skills(
         if remove_deleted:
             dest = _find_skill_dest_by_name(name, skills_dir)
             if dest is not None and dest.exists():
+                escape_err = validate_within_dir(dest, skills_dir)
+                if escape_err:
+                    logger.warning(
+                        "skills-sync refused remove %s at %s: %s",
+                        name, dest, escape_err,
+                    )
+                    continue
                 try:
                     if dest.is_dir() and not dest.is_symlink():
                         shutil.rmtree(dest)
