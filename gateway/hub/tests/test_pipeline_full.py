@@ -275,3 +275,121 @@ async def test_all_channels_fail_returns_failed_status() -> None:
 
     assert result.status == "failed"
     assert all(d.status == "failed" for d in result.deliveries)
+
+
+# ===== H1: audit-push failure must NOT abort the pipeline =====
+
+import httpx
+
+
+@pytest.mark.asyncio
+async def test_audit_push_5xx_during_dispatch_does_not_abort_pipeline() -> None:
+    """H1: if MC returns 5xx on a post_audit call AFTER dispatch, the pipeline
+    must still complete and return the delivered notification result.
+
+    Before the fix, an httpx.HTTPStatusError raised from post_audit (after step 2)
+    propagated out of run_pipeline → FastAPI → 500 to caller, while the
+    notification had actually been delivered (orphaned audit log).
+    """
+    rule = {"id": "rule_1", "slug": "ops-info", "priority": 3, "channel_set_id": "cs_1"}
+    channel_set = {
+        "id": "cs_1",
+        "members": [{"position": 1, "channel": {"id": "ch_inbox_1", "type": "inbox_mc"}}],
+    }
+    registry = FakeRegistry(
+        source=make_source(),
+        topic=make_topic(),
+        rules=[rule],
+        channel_set=channel_set,
+    )
+    # Replace post_audit with a mock that raises like httpx.raise_for_status would
+    boom_request = httpx.Request("POST", "http://mc/api/audit")
+    boom_response = httpx.Response(503, request=boom_request)
+    registry.post_audit = AsyncMock(
+        side_effect=httpx.HTTPStatusError("MC down", request=boom_request, response=boom_response)
+    )
+
+    result = await run_pipeline(make_intent(), source_token_hash="h", registry=registry)
+
+    # Pipeline completed; notification was delivered to the inbox adapter (NoOp)
+    assert result.status == "delivered"
+    # post_audit was called many times — all raised, all were swallowed
+    assert registry.post_audit.await_count >= 4
+
+
+@pytest.mark.asyncio
+async def test_audit_push_5xx_during_step2_does_not_abort_pipeline() -> None:
+    """Same protection applies to the audit-pushes inside the validate_and_lookup
+    try/except. PipelineError catches PipelineError, NOT httpx errors — so
+    the audits in steps 1-2 must also be wrapped.
+    """
+    rule = {"id": "rule_1", "slug": "ops-info", "priority": 3, "channel_set_id": "cs_1"}
+    channel_set = {
+        "id": "cs_1",
+        "members": [{"position": 1, "channel": {"id": "ch_inbox_1", "type": "inbox_mc"}}],
+    }
+    registry = FakeRegistry(
+        source=make_source(),
+        topic=make_topic(),
+        rules=[rule],
+        channel_set=channel_set,
+    )
+    boom_request = httpx.Request("POST", "http://mc/api/audit")
+    boom_response = httpx.Response(503, request=boom_request)
+    registry.post_audit = AsyncMock(
+        side_effect=httpx.HTTPStatusError("MC down", request=boom_request, response=boom_response)
+    )
+
+    # No exception should escape from run_pipeline
+    result = await run_pipeline(make_intent(), source_token_hash="h", registry=registry)
+    assert result.status == "delivered"
+
+
+# ===== H2: Cooldown gate must actually block per-channel resend =====
+
+@pytest.mark.asyncio
+async def test_cooldown_blocks_repeat_send_to_same_channel() -> None:
+    """H2: dispatch records cooldown for channel. Subsequent send to same
+    source+topic+channel within cooldown window must be suppressed at dispatch.
+    Before the fix, Step 4 declared 'cooldown_check_passed' but never invoked
+    is_in_cooldown, so spamming the same channel was unbounded.
+    """
+    from gateway.hub.cooldown import reset_cooldown_state as _reset_cd
+    _reset_cd()
+    rule = {"id": "rule_1", "slug": "ops-info", "priority": 3, "channel_set_id": "cs_1"}
+    channel_set = {
+        "id": "cs_1",
+        "members": [{"position": 1, "channel": {"id": "ch_inbox_repeat", "type": "inbox_mc"}}],
+    }
+    # First send delivers + records cooldown
+    registry1 = FakeRegistry(
+        source=make_source(),
+        topic=make_topic(),
+        rules=[rule],
+        channel_set=channel_set,
+    )
+    intent1 = make_intent(dedupe_key="key-1")
+    result1 = await run_pipeline(intent1, source_token_hash="h", registry=registry1)
+    assert result1.status == "delivered"
+
+    # Second send within cooldown window — dispatch must be suppressed for the
+    # channel (status=failed with cooldown_active error from AdapterResult).
+    # Reset dedupe/flapping so they don't short-circuit before dispatch.
+    from gateway.hub.dedupe import reset_dedupe_state as _reset_dd
+    from gateway.hub.flapping import reset_flapping_state as _reset_fl
+    _reset_dd()
+    _reset_fl()
+    registry2 = FakeRegistry(
+        source=make_source(),
+        topic=make_topic(),
+        rules=[rule],
+        channel_set=channel_set,
+    )
+    intent2 = make_intent(dedupe_key="key-2")
+    result2 = await run_pipeline(intent2, source_token_hash="h", registry=registry2)
+    # All channels suppressed → aggregate "failed"
+    assert result2.status == "failed"
+    assert result2.deliveries[0].status == "failed"
+    # Confirm the cooldown_block audit was pushed
+    audit_actions = [c.kwargs.get("action") for c in registry2.post_audit.await_args_list]
+    assert "cooldown_block" in audit_actions

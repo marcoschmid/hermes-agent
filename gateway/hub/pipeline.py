@@ -14,10 +14,11 @@ Each step pushes an audit-event to the MC registry. A pipeline rejection in
 steps 1-2 surfaces as PipelineError; everything past Step 2 returns a
 NotificationResult with a suppressed_* / failed status.
 """
+import logging
 from dataclasses import dataclass
 
-from gateway.hub.adapter_registry import dispatch_to_channel_set
-from gateway.hub.cooldown import record_cooldown
+from gateway.hub.adapter_registry import AdapterResult, get_adapter
+from gateway.hub.cooldown import is_in_cooldown, record_cooldown
 from gateway.hub.dedupe import check_dedup
 from gateway.hub.flapping import is_flapping, record_state_change
 from gateway.hub.registry_client import RegistryClient
@@ -28,8 +29,26 @@ from gateway.hub.schemas import (
     NotificationResult,
 )
 
+logger = logging.getLogger(__name__)
+
 
 SEVERITY_ORDER = {"debug": 0, "info": 1, "notice": 2, "warn": 3, "error": 4, "crit": 5}
+
+
+async def _safe_audit(registry: RegistryClient, **kwargs) -> None:
+    """Push an audit event without ever aborting the pipeline.
+
+    Audit-push must be best-effort: a transient MC outage should not turn a
+    successful dispatch into an HTTP 500 to the caller. Failures are logged
+    and the pipeline continues.
+    """
+    try:
+        await registry.post_audit(**kwargs)
+    except Exception as exc:  # broad on purpose — never re-raise out of audit
+        logger.warning(
+            "audit-push failed (action=%s entity=%s): %s",
+            kwargs.get("action"), kwargs.get("entity_type"), exc,
+        )
 
 
 @dataclass
@@ -118,11 +137,11 @@ async def run_pipeline(
     # Step 1+2: Schema valid (Pydantic) + Registry-Lookup
     try:
         ctx = await validate_and_lookup(intent, source_token_hash, registry)
-        await registry.post_audit(
+        await _safe_audit(registry, 
             event_id=None, actor="hermes-dispatcher", action="received",
             entity_type="source", entity_id=ctx.source["id"],
         )
-        await registry.post_audit(
+        await _safe_audit(registry, 
             event_id=None, actor="hermes-dispatcher", action="validated",
             entity_type="topic", entity_id=ctx.topic["id"],
         )
@@ -132,7 +151,7 @@ async def run_pipeline(
     # Step 3: Dedup
     dedup = check_dedup(ctx.source["id"], ctx.topic["id"], intent.dedupe_key)
     if dedup.is_duplicate:
-        await registry.post_audit(
+        await _safe_audit(registry, 
             event_id=None, actor="hermes-dispatcher", action="dedupe_hit",
             reason=f"count={dedup.count}",
         )
@@ -145,29 +164,31 @@ async def run_pipeline(
                 "suppressed_until": dedup.suppressed_until.isoformat() if dedup.suppressed_until else None,
             },
         )
-    await registry.post_audit(
+    await _safe_audit(registry, 
         event_id=None, actor="hermes-dispatcher", action="dedupe_check_passed",
     )
 
-    # Step 4: Cooldown — checked per-channel, deferred to dispatch step (channels not known yet)
-    await registry.post_audit(
-        event_id=None, actor="hermes-dispatcher", action="cooldown_check_passed",
+    # Step 4: Cooldown — pre-check defers to per-channel evaluation in Step 8
+    # (channel set not known yet). Audit pre-check so the dispatcher contract
+    # has its expected event order; per-channel cooldown decisions audit below.
+    await _safe_audit(registry,
+        event_id=None, actor="hermes-dispatcher", action="cooldown_pre_check",
     )
 
     # Step 5: Flapping
     record_state_change(ctx.source["id"], ctx.topic["id"])
     if is_flapping(ctx.source["id"], ctx.topic["id"]):
-        await registry.post_audit(
+        await _safe_audit(registry, 
             event_id=None, actor="hermes-dispatcher", action="flapping_block",
         )
         return NotificationResult(status="suppressed_flapping")
-    await registry.post_audit(
+    await _safe_audit(registry, 
         event_id=None, actor="hermes-dispatcher", action="flapping_check_passed",
     )
 
     # Step 6: Quiet-Hours — Phase 1: skipped (no policies seeded)
     # Phase 2 will fetch quiet_policies via registry + apply
-    await registry.post_audit(
+    await _safe_audit(registry, 
         event_id=None, actor="hermes-dispatcher", action="quiet_check_passed",
         reason="no_policies_phase1",
     )
@@ -183,43 +204,70 @@ async def run_pipeline(
         source_id=ctx.source["id"],
     )
     if rule is None or channel_set is None:
-        await registry.post_audit(
+        await _safe_audit(registry, 
             event_id=None, actor="hermes-dispatcher", action="no_rule_match",
         )
         return NotificationResult(status="suppressed_no_rule")
-    await registry.post_audit(
+    await _safe_audit(registry, 
         event_id=None, actor="hermes-dispatcher", action="rule_matched",
         entity_type="rule", entity_id=rule["id"],
     )
 
-    # Step 8: Dispatch
+    # Step 8: Dispatch (per channel, with per-channel cooldown gate from Step 4)
     event_dict = intent.model_dump()
-    results = await dispatch_to_channel_set(channel_set, event_dict)
     members = channel_set.get("members", [])
-    deliveries = [
-        DeliveryResult(
-            channel_id=member["channel"]["id"],
+    results: list[AdapterResult] = []
+    deliveries: list[DeliveryResult] = []
+    for member in members:
+        channel = member.get("channel", {})
+        channel_id = channel.get("id")
+        ch_type = channel.get("type")
+
+        # Per-channel cooldown gate — H2 fix: previously declared in Step 4 but
+        # never enforced. Skip dispatch + audit suppressed_cooldown when active.
+        if channel_id and is_in_cooldown(ctx.source["id"], channel_id, ctx.topic["id"]):
+            await _safe_audit(registry,
+                event_id=None, actor="hermes-dispatcher", action="cooldown_block",
+                entity_type="channel", entity_id=channel_id,
+            )
+            suppressed_result = AdapterResult(status="failed", error="cooldown_active")
+            results.append(suppressed_result)
+            deliveries.append(DeliveryResult(
+                channel_id=channel_id,
+                status="failed",
+                provider_message_id=None,
+                latency_ms=None,
+            ))
+            continue
+
+        adapter = get_adapter(ch_type)
+        if adapter is None:
+            r = AdapterResult(status="failed", error=f"No adapter for channel_type={ch_type}")
+        else:
+            try:
+                r = await adapter.send(event_dict, channel)
+            except Exception as e:
+                r = AdapterResult(status="failed", error=str(e))
+        results.append(r)
+        deliveries.append(DeliveryResult(
+            channel_id=channel_id,
             status=r.status,
             provider_message_id=r.provider_message_id,
             latency_ms=r.latency_ms,
-        )
-        for member, r in zip(members, results)
-    ]
+        ))
 
-    # Audit per delivery + record cooldown for successful sends
-    for member, r in zip(members, results):
-        await registry.post_audit(
+        await _safe_audit(registry,
             event_id=None, actor="hermes-dispatcher",
             action="sent" if r.status == "delivered" else "failed",
-            entity_type="channel", entity_id=member["channel"]["id"],
+            entity_type="channel", entity_id=channel_id,
             reason=r.error,
         )
-        if r.status == "delivered":
-            record_cooldown(ctx.source["id"], member["channel"]["id"], ctx.topic["id"])
+        if r.status == "delivered" and channel_id:
+            record_cooldown(ctx.source["id"], channel_id, ctx.topic["id"])
 
     # Aggregate status
     delivered_count = sum(1 for r in results if r.status == "delivered")
-    if delivered_count == len(results):
+    if delivered_count == len(results) and len(results) > 0:
         agg_status = "delivered"
     elif delivered_count == 0:
         agg_status = "failed"

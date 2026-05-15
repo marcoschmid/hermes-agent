@@ -25,15 +25,29 @@ def _parse_hhmm(s: str) -> time:
 
 
 def _in_window(now_local: datetime, from_str: str, to_str: str, days: list[int]) -> bool:
-    if now_local.weekday() not in days:
-        return False
+    """Return True if *now_local* falls inside [from_str, to_str) on a matching day.
+
+    Days are evaluated by the weekday that "owns" the time slice:
+      - same-day window (f <= t): match if today's weekday in days AND f <= nt < t.
+      - cross-midnight window (f > t): the late half (nt >= f) belongs to today;
+        the early-morning half (nt < t) belongs to yesterday's weekday.
+        e.g. window 23:00→07:00 + days=[0..4] (Mon-Fri):
+        Friday 23:30 matches (today=Fri ∈ days);
+        Saturday 02:00 matches (yesterday=Fri ∈ days);
+        Sunday 02:00 does NOT match (yesterday=Sat ∉ days).
+    """
     f = _parse_hhmm(from_str)
     t = _parse_hhmm(to_str)
     nt = now_local.time()
+    today = now_local.weekday()
     if f <= t:
-        return f <= nt < t
-    # Cross-midnight
-    return nt >= f or nt < t
+        return today in days and f <= nt < t
+    # Cross-midnight — overnight half belongs to yesterday's weekday slot.
+    if nt >= f:
+        return today in days
+    if nt < t:
+        return ((today - 1) % 7) in days
+    return False
 
 
 def is_in_quiet_hours(
