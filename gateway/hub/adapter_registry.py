@@ -19,27 +19,17 @@ class AdapterResult:
     error: Optional[str] = None
 
 
-class InboxMcAdapter:
-    """No-op adapter — event lives in MC notification_events table.
-    Dispatch returns success immediately (delivery handled by MC-side createEvent)."""
-    name = "inbox_mc"
-
-    async def send(self, event: dict, channel: dict) -> AdapterResult:
-        return AdapterResult(status="delivered", provider_message_id=None, latency_ms=0)
+# InboxMcAdapter wandert nach gateway/hub/adapters/inbox_mc.py
+from gateway.hub.adapters.inbox_mc import InboxMcAdapter  # noqa: E402  (registry-import)
 
 
-class TelegramAdapterStub:
-    """Phase 1 stub. Phase 2 wires up gateway.platforms.telegram for real delivery."""
-    name = "telegram"
-
-    async def send(self, event: dict, channel: dict) -> AdapterResult:
-        # Phase 1: log-only stub
-        return AdapterResult(status="delivered", provider_message_id="stub-tg-msg", latency_ms=10)
+# TelegramAdapter wandert nach gateway/hub/adapters/telegram.py
+from gateway.hub.adapters.telegram import TelegramAdapter  # noqa: E402
 
 
 ADAPTER_MAP: dict[str, type] = {
     "inbox_mc": InboxMcAdapter,
-    "telegram": TelegramAdapterStub,
+    "telegram": TelegramAdapter,
 }
 
 
