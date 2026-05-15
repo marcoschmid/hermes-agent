@@ -489,6 +489,7 @@ class TestSyncSkills:
         assert result == {
             "copied": [], "updated": [], "skipped": 0,
             "user_modified": [], "cleaned": [], "removed": 0,
+            "rejected": [], "validation_errors": [],
             "total_bundled": 0,
         }
 
