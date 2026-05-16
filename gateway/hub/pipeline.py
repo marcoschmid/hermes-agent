@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from gateway.hub.adapter_registry import AdapterResult, get_adapter
 from gateway.hub.cooldown import is_in_cooldown, record_cooldown
 from gateway.hub.dedupe import check_dedup
+from gateway.hub.dev_guard import is_dev_source
 from gateway.hub.flapping import is_flapping, record_state_change
 from gateway.hub.registry_client import RegistryClient
 from gateway.hub.rule_matcher import find_matching_rule
@@ -323,6 +324,7 @@ async def run_pipeline(
     members = channel_set.get("members", [])
     results: list[AdapterResult] = []
     deliveries: list[DeliveryResult] = []
+    source_is_dev = is_dev_source(ctx.source.get("slug"))
     for member in members:
         channel = member.get("channel", {})
         channel_id = channel.get("id")
@@ -334,6 +336,21 @@ async def run_pipeline(
                 entity_type="channel", entity_id=channel_id, reason="channel_disabled",
             )
             results.append(AdapterResult(status="failed", error="channel_disabled"))
+            deliveries.append(DeliveryResult(
+                channel_id=channel_id, status="failed",
+                provider_message_id=None, latency_ms=None,
+            ))
+            continue
+
+        # Dev-source guard: keep smoke-tests / dev pings out of prod user
+        # channels. Inbox_mc remains the audit sink for all sources.
+        if source_is_dev and ch_type != "inbox_mc":
+            await _safe_audit(registry,
+                event_id=None, actor="hermes-dispatcher", action="dev_guard_skip",
+                entity_type="channel", entity_id=channel_id,
+                reason=f"dev_source slug={ctx.source.get('slug')}",
+            )
+            results.append(AdapterResult(status="failed", error="dev_guard_skip"))
             deliveries.append(DeliveryResult(
                 channel_id=channel_id, status="failed",
                 provider_message_id=None, latency_ms=None,
