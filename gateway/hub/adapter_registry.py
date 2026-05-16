@@ -42,12 +42,18 @@ _adapter_singletons: dict[str, object] = {}
 
 
 def get_adapter(channel_type: str):
-    """Returns adapter singleton for channel-type or None if unsupported."""
+    """Returns adapter singleton for channel-type or None if unsupported.
+
+    Cache key is (channel_type, class). If ADAPTER_MAP swaps the class
+    (e.g. test monkeypatch), the cached instance is replaced. This keeps
+    monkeypatch test-fixtures working while still avoiding httpx-client
+    leaks in production.
+    """
     cls = ADAPTER_MAP.get(channel_type)
     if cls is None:
         return None
     cached = _adapter_singletons.get(channel_type)
-    if cached is None:
+    if cached is None or type(cached) is not cls:
         cached = cls()
         _adapter_singletons[channel_type] = cached
     return cached
