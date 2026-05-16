@@ -215,6 +215,20 @@ async def run_pipeline(
 
     # Step 8: Dispatch (per channel, with per-channel cooldown gate from Step 4)
     event_dict = intent.model_dump()
+    # Inject resolved audience_slug so InboxMcAdapter sends a non-None audience
+    # to MC. Pipeline already resolved topic.default_audience when intent.audience
+    # was None; without this overwrite, model_dump() preserves the original None
+    # and MC /events returns 422.
+    if event_dict.get("audience") is None and ctx.audience_slug:
+        event_dict["audience"] = ctx.audience_slug
+    if not channel_set.get("enabled", True):
+        # Channel-set disabled at registry level — refuse to dispatch.
+        return NotificationResult(
+            status="failed",
+            rule_matched=rule_id,
+            deliveries=[],
+            error="channel_set_disabled",
+        )
     members = channel_set.get("members", [])
     results: list[AdapterResult] = []
     deliveries: list[DeliveryResult] = []
@@ -222,6 +236,18 @@ async def run_pipeline(
         channel = member.get("channel", {})
         channel_id = channel.get("id")
         ch_type = channel.get("type")
+        if not channel.get("enabled", True):
+            # Channel disabled at registry — skip without dispatch.
+            await _safe_audit(registry,
+                event_id=None, actor="hermes-dispatcher", action="rejected",
+                entity_type="channel", entity_id=channel_id, reason="channel_disabled",
+            )
+            results.append(AdapterResult(status="failed", error="channel_disabled"))
+            deliveries.append(DeliveryResult(
+                channel_id=channel_id, status="failed",
+                provider_message_id=None, latency_ms=None,
+            ))
+            continue
 
         # Per-channel cooldown gate — H2 fix: previously declared in Step 4 but
         # never enforced. Skip dispatch + audit suppressed_cooldown when active.

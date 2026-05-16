@@ -16,6 +16,30 @@ if TYPE_CHECKING:
 DEFAULT_MC_HUB_BASE_URL = "http://127.0.0.1:3334"
 MC_EVENTS_PATH = "/api/board/notifications/events"
 
+# Allowlist for MC base URL hostnames. MC_HUB_BASE_URL is env-controlled,
+# so a poisoned env could redirect MC_HUB_TOKEN to an attacker host (SSRF).
+# Restrict to loopback by default; broader allowlist needs explicit opt-in
+# via MC_HUB_ALLOW_HOSTS env (comma-separated).
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+
+
+def _validate_base_url(url: str) -> None:
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise AdapterDeliveryError("configuration", f"MC_HUB_BASE_URL scheme rejected: {parsed.scheme}")
+    host = (parsed.hostname or "").lower()
+    if host in _LOOPBACK_HOSTS:
+        return
+    allow_extra = os.environ.get("MC_HUB_ALLOW_HOSTS", "")
+    allowed = {h.strip().lower() for h in allow_extra.split(",") if h.strip()}
+    if host in allowed:
+        return
+    raise AdapterDeliveryError(
+        "configuration",
+        f"MC_HUB_BASE_URL host '{host}' not in loopback allowlist; set MC_HUB_ALLOW_HOSTS to override",
+    )
+
 
 class McEventData(BaseModel):
     event_id: str = Field(min_length=1)
@@ -36,6 +60,7 @@ class InboxMcAdapter:
         timeout: float = 10.0,
     ) -> None:
         self.base_url = base_url or os.environ.get("MC_HUB_BASE_URL", DEFAULT_MC_HUB_BASE_URL)
+        _validate_base_url(self.base_url)
         self.token = token
         self.timeout = timeout
         self._owned_client = client is None

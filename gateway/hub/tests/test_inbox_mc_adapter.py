@@ -30,6 +30,7 @@ def make_event(**overrides) -> dict:
 async def send_with_transport(handler, monkeypatch, event: dict | None = None) -> AdapterResult:
     monkeypatch.setenv("MC_HUB_BASE_URL", "http://mc.test")
     monkeypatch.setenv("MC_HUB_TOKEN", "test-token")
+    monkeypatch.setenv("MC_HUB_ALLOW_HOSTS", "mc.test")
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(
         transport=transport,
