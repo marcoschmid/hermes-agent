@@ -48,7 +48,7 @@ async def test_success(monkeypatch) -> None:
         body = json.loads(request.content)
         assert body["source_slug"] == "paperclip"
         assert body["topic"] == "ops.deploy"
-        return httpx.Response(201, json={"event_id": "mc-event-id"})
+        return httpx.Response(201, json={"data": {"event_id": "mc-event-id"}})
 
     result = await send_with_transport(handler, monkeypatch)
 

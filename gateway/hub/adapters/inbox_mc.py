@@ -17,8 +17,12 @@ DEFAULT_MC_HUB_BASE_URL = "http://127.0.0.1:3334"
 MC_EVENTS_PATH = "/api/board/notifications/events"
 
 
-class McEventResponse(BaseModel):
+class McEventData(BaseModel):
     event_id: str = Field(min_length=1)
+
+
+class McEventResponse(BaseModel):
+    data: McEventData
 
 
 class InboxMcAdapter:
@@ -82,6 +86,6 @@ class InboxMcAdapter:
 
         return AdapterResult(
             status="delivered",
-            provider_message_id=mc_response.event_id,
+            provider_message_id=mc_response.data.event_id,
             latency_ms=latency_ms,
         )

@@ -83,9 +83,9 @@ class TelegramAdapter:
 
     @staticmethod
     def _resolve_chat_id(channel: dict) -> str:
-        chat_id = channel.get("target") or channel.get("chat_id")
+        chat_id = channel.get("target_ref") or channel.get("target") or channel.get("chat_id")
         if not chat_id:
-            raise AdapterDeliveryError("configuration", "telegram channel missing target/chat_id")
+            raise AdapterDeliveryError("configuration", "telegram channel missing target_ref/target/chat_id")
         return str(chat_id)
 
     @staticmethod
