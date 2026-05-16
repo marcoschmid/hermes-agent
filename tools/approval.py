@@ -440,9 +440,27 @@ def has_blocking_approval(session_key: str) -> bool:
 
 
 def submit_pending(session_key: str, approval: dict):
-    """Store a pending approval request for a session."""
+    """Store a pending approval request for a session.
+
+    Additionally emits to the Decision-Board (if configured) for cross-channel
+    visibility. The emission is fire-and-forget and never affects the existing
+    Telegram/Slack/CLI flow.
+    """
     with _lock:
         _pending[session_key] = approval
+
+    # Additive: push to MC Decision-Board. Silent no-op if
+    # DECISION_BOARD_HERMES_SECRET unset.
+    try:
+        from gateway.hub.decision_board_emitter import emit_approval_to_decision_board
+        emit_approval_to_decision_board(
+            session_key=session_key,
+            command=approval.get("command", ""),
+            pattern_key=approval.get("pattern_key", "unknown"),
+            description=approval.get("description", ""),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("submit_pending: decision-board emit failed (non-fatal): %s", e)
 
 
 def approve_session(session_key: str, pattern_key: str):
