@@ -41,7 +41,7 @@ async def test_migration_idempotent(tmp_path, monkeypatch) -> None:
         await db.close()
 
     assert [tuple(row) for row in second_schema] == [tuple(row) for row in first_schema]
-    assert [row["version"] for row in second_migrations] == [1]
+    assert [row["version"] for row in second_migrations] == [1, 2]
     assert [tuple(row) for row in second_migrations] == [tuple(row) for row in first_migrations]
 
 

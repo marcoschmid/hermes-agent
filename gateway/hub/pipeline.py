@@ -128,6 +128,7 @@ async def run_pipeline(
     intent: NotificationIntent,
     source_token_hash: str,
     registry: RegistryClient,
+    state=None,  # Optional HubState — if provided, writes audit-row to hub_events_log
 ) -> NotificationResult:
     """Run all 8 steps. Push audit to MC after each step.
 
@@ -299,6 +300,25 @@ async def run_pipeline(
         agg_status = "failed"
     else:
         agg_status = "partial"
+
+    # T4: Write durable audit-row to hub_events_log if state was provided.
+    # status maps: delivered → delivered_inbox; failed → failed; partial → failed
+    # (Phase v4a status enum is coarser than NotificationResult — refined v4b)
+    if state is not None:
+        import json as _json
+        import time as _time
+        import uuid as _uuid
+        event_id_for_log = f"evt_{_uuid.uuid4().hex[:16]}"
+        log_status = "delivered_inbox" if agg_status == "delivered" else "failed"
+        try:
+            await state.execute(
+                "INSERT INTO hub_events_log (event_id, source_slug, topic_slug, status, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (event_id_for_log, intent.source_slug, intent.topic, log_status,
+                 _json.dumps(intent.model_dump()), int(_time.time())),
+            )
+        except Exception as exc:
+            logger.warning("hub_events_log insert failed: %s", exc)
 
     return NotificationResult(
         status=agg_status,
