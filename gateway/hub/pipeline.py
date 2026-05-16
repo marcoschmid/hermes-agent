@@ -1,19 +1,21 @@
 """Hub dispatch pipeline.
 
-Implements the 8-step pipeline for inbound notifications:
+Implements the 9-step pipeline for inbound notifications:
   1. Schema validation (via Pydantic, before pipeline call)
   2. Registry lookup (source, topic, audience, severity_max)
-  3. Dedup-window check (in-memory, Phase 1)
-  4. Cooldown check (per-channel, deferred to dispatch)
-  5. Flapping detection (state-change counter)
-  6. Quiet-Hours (Phase 1: skipped — no policies seeded)
-  7. Rule-Match (registry-driven, priority asc wins)
-  8. Dispatch via channel-set adapters
+  3. Source-scope check (allowed_topics, allowed_audiences, max_severity)
+  4. Dedup-window check (in-memory, Phase 1)
+  5. Cooldown check (per-channel, deferred to dispatch)
+  6. Flapping detection (state-change counter)
+  7. Quiet-Hours (Phase 1: skipped — no policies seeded)
+  8. Rule-Match (registry-driven, priority asc wins)
+  9. Dispatch via channel-set adapters
 
 Each step pushes an audit-event to the MC registry. A pipeline rejection in
-steps 1-2 surfaces as PipelineError; everything past Step 2 returns a
+steps 1-3 surfaces as PipelineError; everything past Step 3 returns a
 NotificationResult with a suppressed_* / failed status.
 """
+import json
 import logging
 from dataclasses import dataclass
 
@@ -72,6 +74,38 @@ class ResolvedContext:
     # cache-key in registry_client stays slug-stable across senders.
 
 
+def _coerce_scope_list(value) -> list[str] | None:
+    """Return scope values as a list, or None for legacy wildcard."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
+
+
+async def _raise_scope_violation(
+    registry: RegistryClient,
+    source: dict,
+    error_code: str,
+    message: str,
+) -> None:
+    await _safe_audit(
+        registry,
+        event_id=None,
+        actor="hermes-dispatcher",
+        action="scope_violation",
+        entity_type="source",
+        entity_id=source.get("id"),
+        reason=error_code,
+    )
+    raise PipelineError(403, error_code, message)
+
+
 async def validate_and_lookup(
     intent: NotificationIntent,
     source_token_hash: str,
@@ -124,13 +158,65 @@ async def validate_and_lookup(
     return ResolvedContext(source=source, topic=topic, audience_slug=audience_slug)
 
 
+async def validate_scope(
+    intent: NotificationIntent,
+    ctx: ResolvedContext,
+    registry: RegistryClient,
+) -> None:
+    """Step 3: enforce per-source topic/audience/severity scope."""
+    allowed_topics = _coerce_scope_list(ctx.source.get("allowed_topics"))
+    if allowed_topics is not None and intent.topic not in allowed_topics:
+        await _raise_scope_violation(
+            registry,
+            ctx.source,
+            "topic_not_allowed",
+            f"Source {intent.source_slug} is not allowed to send topic {intent.topic}",
+        )
+
+    allowed_audiences = _coerce_scope_list(ctx.source.get("allowed_audiences"))
+    if allowed_audiences is not None and ctx.audience_slug not in allowed_audiences:
+        await _raise_scope_violation(
+            registry,
+            ctx.source,
+            "audience_not_allowed",
+            f"Source {intent.source_slug} is not allowed to send audience {ctx.audience_slug}",
+        )
+
+    max_severity = ctx.source.get("max_severity")
+    if max_severity is not None:
+        max_severity = str(max_severity)
+        if max_severity not in SEVERITY_ORDER:
+            await _raise_scope_violation(
+                registry,
+                ctx.source,
+                "scope_config_invalid",
+                f"Source {intent.source_slug} has invalid max scoped severity {max_severity}",
+            )
+        if SEVERITY_ORDER[intent.severity] > SEVERITY_ORDER[max_severity]:
+            await _raise_scope_violation(
+                registry,
+                ctx.source,
+                "severity_exceeded",
+                f"Source {intent.source_slug} max scoped severity is {max_severity}, got {intent.severity}",
+            )
+
+    await _safe_audit(
+        registry,
+        event_id=None,
+        actor="hermes-dispatcher",
+        action="scope_check_passed",
+        entity_type="source",
+        entity_id=ctx.source.get("id"),
+    )
+
+
 async def run_pipeline(
     intent: NotificationIntent,
     source_token_hash: str,
     registry: RegistryClient,
     state=None,  # Optional HubState — if provided, writes audit-row to hub_events_log
 ) -> NotificationResult:
-    """Run all 8 steps. Push audit to MC after each step.
+    """Run all 9 steps. Push audit to MC after each step.
 
     event_id is None in Phase 1 — MC owns event-id assignment via createEvent.
     The audit-stream is keyed off (source, topic, channel) instead.
@@ -149,7 +235,11 @@ async def run_pipeline(
     except PipelineError as e:
         return NotificationResult(status="failed", error=f"{e.error_code}: {e.message}")
 
-    # Step 3: Dedup
+    # Step 3: Source scope. Violations intentionally propagate so the API
+    # returns HTTP 403 instead of a 200 with status=failed.
+    await validate_scope(intent, ctx, registry)
+
+    # Step 4: Dedup
     dedup = check_dedup(ctx.source["id"], ctx.topic["id"], intent.dedupe_key)
     if dedup.is_duplicate:
         await _safe_audit(registry, 
@@ -169,14 +259,14 @@ async def run_pipeline(
         event_id=None, actor="hermes-dispatcher", action="dedupe_check_passed",
     )
 
-    # Step 4: Cooldown — pre-check defers to per-channel evaluation in Step 8
+    # Step 5: Cooldown — pre-check defers to per-channel evaluation in Step 9
     # (channel set not known yet). Audit pre-check so the dispatcher contract
     # has its expected event order; per-channel cooldown decisions audit below.
     await _safe_audit(registry,
         event_id=None, actor="hermes-dispatcher", action="cooldown_pre_check",
     )
 
-    # Step 5: Flapping
+    # Step 6: Flapping
     record_state_change(ctx.source["id"], ctx.topic["id"])
     if is_flapping(ctx.source["id"], ctx.topic["id"]):
         await _safe_audit(registry, 
@@ -187,14 +277,14 @@ async def run_pipeline(
         event_id=None, actor="hermes-dispatcher", action="flapping_check_passed",
     )
 
-    # Step 6: Quiet-Hours — Phase 1: skipped (no policies seeded)
+    # Step 7: Quiet-Hours — Phase 1: skipped (no policies seeded)
     # Phase 2 will fetch quiet_policies via registry + apply
     await _safe_audit(registry, 
         event_id=None, actor="hermes-dispatcher", action="quiet_check_passed",
         reason="no_policies_phase1",
     )
 
-    # Step 7: Rule-Match
+    # Step 8: Rule-Match
     rule, channel_set = await find_matching_rule(
         registry,
         topic=intent.topic,
@@ -214,7 +304,7 @@ async def run_pipeline(
         entity_type="rule", entity_id=rule["id"],
     )
 
-    # Step 8: Dispatch (per channel, with per-channel cooldown gate from Step 4)
+    # Step 9: Dispatch (per channel, with per-channel cooldown gate from Step 5)
     event_dict = intent.model_dump()
     # Inject resolved audience_slug so InboxMcAdapter sends a non-None audience
     # to MC. Pipeline already resolved topic.default_audience when intent.audience
@@ -226,7 +316,7 @@ async def run_pipeline(
         # Channel-set disabled at registry level — refuse to dispatch.
         return NotificationResult(
             status="failed",
-            rule_matched=rule_id,
+            rule_matched=rule.get("slug"),
             deliveries=[],
             error="channel_set_disabled",
         )

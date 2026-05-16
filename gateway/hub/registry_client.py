@@ -4,6 +4,7 @@ Reads tokens from env (MC_HUB_TOKEN, MC_BASE_URL).
 Uses httpx.AsyncClient with shared lifespan for connection pooling.
 5-min TTL cache for source/topic/rules/channel-set lookups.
 """
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -60,8 +61,31 @@ class RegistryClient:
             return None
         r.raise_for_status()
         data = r.json().get("data")
+        if isinstance(data, dict):
+            data = self._normalize_source_scope(data)
         self._cache_set(cache_key, data)
         return data
+
+    def _normalize_source_scope(self, source: dict) -> dict:
+        """Decode MC JSON-array scope fields when present.
+
+        Mission Control stores source scopes as nullable TEXT columns containing
+        JSON arrays. Normalize them to Python lists at the boundary while keeping
+        legacy/missing/null fields as None.
+        """
+        normalized = dict(source)
+        for key in ("allowed_topics", "allowed_audiences"):
+            value = normalized.get(key)
+            if value is None or isinstance(value, list):
+                continue
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, list):
+                    normalized[key] = parsed
+        return normalized
 
     async def get_topic(self, slug: str) -> dict | None:
         cache_key = f"topic:{slug}"

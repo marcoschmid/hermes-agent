@@ -152,7 +152,7 @@ async def notifications(request: Request) -> dict:
     Bearer as transition fallback. PipelineError → proper HTTPException.
     """
     body = await request.body()
-    source_slug = await _authenticate(request, body)  # raises HTTPException on auth-fail
+    authed_source_slug = await _authenticate(request, body)  # raises HTTPException on auth-fail
 
     try:
         body_json = json.loads(body)
@@ -162,6 +162,19 @@ async def notifications(request: Request) -> dict:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"error_code": "schema_invalid", "message": str(exc)},
         ) from exc
+
+    # Structural identity check: the HMAC-authenticated source_slug MUST match
+    # the slug Pydantic parsed into the intent. Empty authed_source_slug means
+    # the back-compat HUB_PILOT_TOKEN path was taken (no per-source identity);
+    # only that path is allowed to dispatch as any source.
+    if authed_source_slug and authed_source_slug != intent.source_slug:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error_code": "source_identity_mismatch",
+                "message": "HMAC-authed source_slug does not match body intent.source_slug",
+            },
+        )
 
     try:
         result = await run_pipeline(

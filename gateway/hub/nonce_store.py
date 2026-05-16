@@ -10,22 +10,32 @@ Caller schedule: prune_old on startup + periodically (e.g. hourly).
 """
 from __future__ import annotations
 
+import sqlite3
 import time
 
 from gateway.hub.hub_state import HubState
 
 
 async def remember_or_replay(state: HubState, nonce: str, source_slug: str) -> bool:
-    """Insert nonce. Returns True if first-seen, False on replay (PK conflict)."""
+    """Insert nonce. Returns True if first-seen, False on replay (PK conflict).
+
+    Catches sqlite3.IntegrityError specifically. All other DB errors propagate
+    so a brief DB outage does not silently appear as a stream of replay-401s.
+    Some async-sqlite wrappers translate IntegrityError into their own error
+    type, so we also check by name for safety.
+    """
     try:
         await state.execute(
             "INSERT INTO hub_nonces (nonce, source_slug, created_at) VALUES (?, ?, ?)",
             (nonce, source_slug, int(time.time())),
         )
         return True
+    except sqlite3.IntegrityError:
+        return False
     except Exception as exc:
-        # sqlite3.IntegrityError or wrapper — PK constraint = replay
-        if "UNIQUE" in str(exc) or "PRIMARY" in str(exc).upper() or "constraint" in str(exc).lower():
+        # Some wrappers (aiosqlite forks) raise their own IntegrityError class
+        # that doesn't subclass sqlite3.IntegrityError; recognise by name.
+        if type(exc).__name__ == "IntegrityError":
             return False
         raise
 
