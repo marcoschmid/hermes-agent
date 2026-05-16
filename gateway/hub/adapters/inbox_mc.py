@@ -71,6 +71,10 @@ class InboxMcAdapter:
             )
         except httpx.TimeoutException as exc:
             raise AdapterDeliveryError("timeout") from exc
+        except httpx.HTTPError as exc:
+            # Catches ConnectError, RemoteProtocolError, etc — match TelegramAdapter
+            # contract: all transport errors surface as AdapterDeliveryError.
+            raise AdapterDeliveryError("network", str(exc)) from exc
 
         body = response.text
         if response.status_code != 201:

@@ -50,11 +50,19 @@ async def notifications(
 ) -> dict:
     """Run the 8-step dispatch pipeline for an inbound notification intent.
 
-    Phase 2a auth is handled by require_pilot_token.
+    Phase 2a auth model: HUB_PILOT_TOKEN at edge is the *only* auth. The
+    per-source token-hash check from Phase 1 is intentionally bypassed below
+    (source_token_hash=""). This widens the trust boundary — any caller with
+    the pilot token can dispatch as ANY registered source slug without that
+    source's own token. Acceptable for localhost-only standalone deployment.
+
+    Phase v4 will replace this with HMAC(timestamp+nonce+body) per-source
+    secret, restoring per-source identity + adding replay protection.
+    See docs/plans/2026-05-16-phase-v4-foundation.md (AD-1, AD-2).
     """
     result = await run_pipeline(
         intent,
-        source_token_hash="",
+        source_token_hash="",  # Phase 2a: see docstring above; v4 will fix.
         registry=get_registry(),
     )
     return {"data": result.model_dump(exclude_none=True)}

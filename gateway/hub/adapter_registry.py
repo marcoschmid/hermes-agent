@@ -33,12 +33,36 @@ ADAPTER_MAP: dict[str, type] = {
 }
 
 
+# Module-level adapter cache: each adapter owns its httpx.AsyncClient with a
+# connection pool. Without caching, every notification dispatch creates a new
+# client and leaks the connection pool (no .close() is ever called). The lazy
+# init keeps tests that monkeypatch ADAPTER_MAP / environment-variables
+# independent (cache populates on first request).
+_adapter_singletons: dict[str, object] = {}
+
+
 def get_adapter(channel_type: str):
-    """Returns adapter instance for channel-type or None if unsupported."""
+    """Returns adapter singleton for channel-type or None if unsupported."""
     cls = ADAPTER_MAP.get(channel_type)
     if cls is None:
         return None
-    return cls()
+    cached = _adapter_singletons.get(channel_type)
+    if cached is None:
+        cached = cls()
+        _adapter_singletons[channel_type] = cached
+    return cached
+
+
+async def close_adapters() -> None:
+    """Close all cached adapter httpx clients. Call on app shutdown."""
+    for adapter in list(_adapter_singletons.values()):
+        close = getattr(adapter, "close", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:
+                pass
+    _adapter_singletons.clear()
 
 
 async def dispatch_to_channel_set(channel_set: dict, event: dict) -> list[AdapterResult]:

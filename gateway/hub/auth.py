@@ -25,7 +25,9 @@ def require_pilot_token(authorization: Optional[str] = Header(default=None)) -> 
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Pilot token not configured",
         )
-    token = authorization[len("Bearer "):]
+    # strip(): tolerate trailing newline/whitespace that env-files commonly carry
+    # (e.g. `HUB_PILOT_TOKEN=$(cat file)` keeps the file's trailing \n).
+    token = authorization[len("Bearer "):].strip()
     if not _constant_time_equal(token, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
