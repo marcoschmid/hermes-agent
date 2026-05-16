@@ -19,36 +19,50 @@ class AdapterResult:
     error: Optional[str] = None
 
 
-class InboxMcAdapter:
-    """No-op adapter — event lives in MC notification_events table.
-    Dispatch returns success immediately (delivery handled by MC-side createEvent)."""
-    name = "inbox_mc"
-
-    async def send(self, event: dict, channel: dict) -> AdapterResult:
-        return AdapterResult(status="delivered", provider_message_id=None, latency_ms=0)
+# InboxMcAdapter wandert nach gateway/hub/adapters/inbox_mc.py
+from gateway.hub.adapters.inbox_mc import InboxMcAdapter  # noqa: E402  (registry-import)
 
 
-class TelegramAdapterStub:
-    """Phase 1 stub. Phase 2 wires up gateway.platforms.telegram for real delivery."""
-    name = "telegram"
-
-    async def send(self, event: dict, channel: dict) -> AdapterResult:
-        # Phase 1: log-only stub
-        return AdapterResult(status="delivered", provider_message_id="stub-tg-msg", latency_ms=10)
+# TelegramAdapter wandert nach gateway/hub/adapters/telegram.py
+from gateway.hub.adapters.telegram import TelegramAdapter  # noqa: E402
 
 
 ADAPTER_MAP: dict[str, type] = {
     "inbox_mc": InboxMcAdapter,
-    "telegram": TelegramAdapterStub,
+    "telegram": TelegramAdapter,
 }
 
 
+# Module-level adapter cache: each adapter owns its httpx.AsyncClient with a
+# connection pool. Without caching, every notification dispatch creates a new
+# client and leaks the connection pool (no .close() is ever called). The lazy
+# init keeps tests that monkeypatch ADAPTER_MAP / environment-variables
+# independent (cache populates on first request).
+_adapter_singletons: dict[str, object] = {}
+
+
 def get_adapter(channel_type: str):
-    """Returns adapter instance for channel-type or None if unsupported."""
+    """Returns adapter singleton for channel-type or None if unsupported."""
     cls = ADAPTER_MAP.get(channel_type)
     if cls is None:
         return None
-    return cls()
+    cached = _adapter_singletons.get(channel_type)
+    if cached is None:
+        cached = cls()
+        _adapter_singletons[channel_type] = cached
+    return cached
+
+
+async def close_adapters() -> None:
+    """Close all cached adapter httpx clients. Call on app shutdown."""
+    for adapter in list(_adapter_singletons.values()):
+        close = getattr(adapter, "close", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:
+                pass
+    _adapter_singletons.clear()
 
 
 async def dispatch_to_channel_set(channel_set: dict, event: dict) -> list[AdapterResult]:

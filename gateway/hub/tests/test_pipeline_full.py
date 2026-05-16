@@ -3,6 +3,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import gateway.hub.adapter_registry as adapter_registry
+from gateway.hub.adapter_registry import AdapterResult
 from gateway.hub.cooldown import reset_cooldown_state
 from gateway.hub.dedupe import reset_dedupe_state
 from gateway.hub.flapping import reset_flapping_state
@@ -52,6 +54,17 @@ class FakeRegistry(RegistryClient):
         return self._channel_set
 
 
+class FakeInboxMcAdapter:
+    name = "inbox_mc"
+
+    async def send(self, event: dict, channel: dict) -> AdapterResult:
+        return AdapterResult(
+            status="delivered",
+            provider_message_id="mc-event-id",
+            latency_ms=0,
+        )
+
+
 @pytest.fixture(autouse=True)
 def _reset_pipeline_state():
     """Reset in-memory pipeline state before AND after each test for isolation."""
@@ -62,6 +75,19 @@ def _reset_pipeline_state():
     reset_dedupe_state()
     reset_cooldown_state()
     reset_flapping_state()
+
+
+@pytest.fixture(autouse=True)
+def _stub_inbox_mc_adapter(monkeypatch):
+    """Keep pipeline tests focused on dispatch orchestration, not MC transport."""
+    original_get_adapter = adapter_registry.get_adapter
+
+    def fake_get_adapter(channel_type: str):
+        if channel_type == "inbox_mc":
+            return FakeInboxMcAdapter()
+        return original_get_adapter(channel_type)
+
+    monkeypatch.setattr("gateway.hub.pipeline.get_adapter", fake_get_adapter)
 
 
 def make_intent(**overrides) -> NotificationIntent:
@@ -311,7 +337,7 @@ async def test_audit_push_5xx_during_dispatch_does_not_abort_pipeline() -> None:
 
     result = await run_pipeline(make_intent(), source_token_hash="h", registry=registry)
 
-    # Pipeline completed; notification was delivered to the inbox adapter (NoOp)
+    # Pipeline completed; notification was delivered to the inbox adapter fake.
     assert result.status == "delivered"
     # post_audit was called many times — all raised, all were swallowed
     assert registry.post_audit.await_count >= 4
