@@ -34,7 +34,11 @@ def _hash(*parts: str) -> str:
 
 def _sign(body: bytes) -> tuple[str, int]:
     ts_ms = int(time.time() * 1000)
-    sig = _hmac.new(HUB_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    # HMAC binds (timestamp.body) -- replays with a stale (body, sig) pair but
+    # a fresh in-window timestamp are rejected by MC. Must match the verify
+    # contract in src/lib/decision-board-hmac.ts (computeSignature).
+    payload = f"{ts_ms}.".encode("utf-8") + body
+    sig = _hmac.new(HUB_SECRET.encode("utf-8"), payload, hashlib.sha256).hexdigest()
     return sig, ts_ms
 
 
