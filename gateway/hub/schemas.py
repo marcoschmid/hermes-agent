@@ -5,6 +5,9 @@ from pydantic import BaseModel, Field
 Severity = Literal["debug", "info", "notice", "warn", "error", "crit"]
 Urgency = Literal["none", "today", "soon", "now"]
 Actionability = Literal["info", "ack", "decide", "task"]
+# v4c-A: sender contract for lifecycle; hub may transition to ACKED/SNOOZED.
+SenderLifecycle = Literal["FIRING", "RECOVERED"]
+RenderVersion = Literal["v4a", "v4c"]
 
 
 class NotificationIntent(BaseModel):
@@ -14,12 +17,22 @@ class NotificationIntent(BaseModel):
     severity: Severity = "info"
     urgency: Urgency = "none"
     actionability: Actionability = "info"
-    audience: Optional[str] = None  # falls None: topic.default_audience_id
+    audience: Optional[str] = None
     title: str = Field(min_length=1, max_length=200)
     body: str = Field(min_length=1, max_length=4000)
     dedupe_key: Optional[str] = Field(default=None, max_length=256)
     correlation_id: Optional[str] = Field(default=None, max_length=128)
     payload: Optional[dict] = None
+    # v4c-A additive fields. All optional; no cross-field validation in v4c-A.
+    service: Optional[str] = Field(default=None, max_length=64)
+    impact: Optional[str] = Field(default=None, max_length=200)
+    action_required: Optional[str] = Field(default=None, max_length=200)
+    context: Optional[dict] = None
+    links: Optional[dict] = None
+    fingerprint: Optional[str] = Field(default=None, max_length=120)
+    started_at: Optional[str] = None
+    lifecycle: SenderLifecycle = "FIRING"
+    render_version: RenderVersion = "v4a"
 
 
 class DeliveryResult(BaseModel):
