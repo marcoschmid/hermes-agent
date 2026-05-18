@@ -102,3 +102,61 @@ async def test_markdownv2_escape(monkeypatch) -> None:
 
     assert captured["body"]["text"] == r"Hello \_team\_ \*now\*\. Go\!"
     await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_send_renders_v4c_payload(monkeypatch) -> None:
+    """v4c render_version → rich layout with severity prefix, service badge, impact, action."""
+    monkeypatch.setenv("TELEGRAM_HERMES_BOT_TOKEN", "test-token")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 42}})
+
+    adapter = make_adapter(handler)
+    event = {
+        "render_version": "v4c",
+        "severity": "warn",
+        "title": "T",
+        "body": "B",
+        "service": "drobo-backup",
+        "impact": "Big",
+        "action_required": "Fix it",
+    }
+    result = await adapter.send(event=event, channel={"target_ref": "123"})
+
+    sent_text = captured["body"]["text"]
+    assert "*T*" in sent_text
+    assert "drobo\\-backup" in sent_text
+    assert "*Impact:*" in sent_text
+    assert "*Action:*" in sent_text
+    assert captured["body"]["parse_mode"] == "MarkdownV2"
+    assert result.provider_message_id == "42"
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_send_v4a_still_returns_plain_body(monkeypatch) -> None:
+    """v4a render_version → legacy plain body (no v4c sections)."""
+    monkeypatch.setenv("TELEGRAM_HERMES_BOT_TOKEN", "test-token")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 7}})
+
+    adapter = make_adapter(handler)
+    event = {
+        "render_version": "v4a",
+        "title": "X",
+        "body": "Plain body content",
+    }
+    await adapter.send(event=event, channel={"target_ref": "123"})
+
+    sent_text = captured["body"]["text"]
+    assert "Plain body content" in sent_text
+    # No v4c sections
+    assert "Impact" not in sent_text
+    assert "Action" not in sent_text
+    await adapter.close()

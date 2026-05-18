@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from gateway.hub.adapters.errors import AdapterDeliveryError
+from gateway.hub.renderers.telegram_v4c import render as render_v4c
 
 _MARKDOWN_V2_SPECIALS = set("_*[]()~`>#+-=|{}.!" + "\\")
 
@@ -39,10 +40,10 @@ class TelegramAdapter:
 
         token = self._resolve_token()
         chat_id = self._resolve_chat_id(channel)
-        body = self._message_body(event)
+        text = render_v4c(event)
         payload = {
             "chat_id": chat_id,
-            "text": escape_markdown_v2(body),
+            "text": text,
             "parse_mode": "MarkdownV2",
         }
         started = time.perf_counter()
