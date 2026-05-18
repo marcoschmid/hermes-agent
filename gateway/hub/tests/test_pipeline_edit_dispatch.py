@@ -182,9 +182,11 @@ async def test_dispatch_calls_edit_when_fingerprint_has_live_event_on_same_chann
     intent = make_intent(fingerprint="drobo/error/2026-05-18")
     result = await run_pipeline(intent, source_token_hash="h", registry=registry)
 
-    # registry was consulted for the fingerprint
+    # registry was consulted for the fingerprint, and channel_id of the
+    # dispatch channel was plumbed through (Task 3.5b) so MC filters its
+    # delivery JOIN to the same channel.
     registry.get_live_event_by_fingerprint.assert_awaited_once_with(
-        "drobo-backup", "drobo/error/2026-05-18"
+        "drobo-backup", "drobo/error/2026-05-18", channel_id="ch_tg_marco"
     )
     # adapter.edit was called, NOT send
     fake_telegram.edit.assert_awaited_once()

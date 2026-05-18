@@ -198,3 +198,52 @@ async def test_get_live_event_by_fingerprint_network_error_returns_none() -> Non
     result = await rc.get_live_event_by_fingerprint("src", "fp")
     assert result is None
     await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_live_event_by_fingerprint_plumbs_channel_param() -> None:
+    """Task 3.5b: channel_id arg → ?channel=… in request query string.
+
+    Verifies the hub passes the dispatch channel through to MC so MC's
+    delivery JOIN is filtered to the same channel — otherwise a multi-
+    delivery event surfaces the wrong row and edit-in-place misses.
+    """
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={
+                "event": {
+                    "id": "evt_42",
+                    "provider_message_id": "tg-mid",
+                    "channel_id": "ch_tg_marco",
+                }
+            },
+        )
+
+    rc = make_client(handler)
+    await rc.get_live_event_by_fingerprint(
+        "drobo-backup", "fp123", channel_id="ch_tg_marco"
+    )
+
+    assert captured["params"]["source"] == "drobo-backup"
+    assert captured["params"]["fingerprint"] == "fp123"
+    assert captured["params"]["channel"] == "ch_tg_marco"
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_live_event_by_fingerprint_omits_channel_when_not_passed() -> None:
+    """Backwards-compat: no channel_id → no ?channel= in request."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"event": None})
+
+    rc = make_client(handler)
+    await rc.get_live_event_by_fingerprint("src", "fp")
+    assert "channel" not in captured["params"]
+    await rc.close()

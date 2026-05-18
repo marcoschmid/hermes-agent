@@ -230,8 +230,12 @@ async def _dispatch_one_channel(
     fingerprint = event.get("fingerprint")
     if fingerprint:
         try:
+            # Task 3.5b: pass channel_id so MC filters its delivery JOIN to
+            # this channel. Without it, multi-delivery events (inbox_mc +
+            # telegram) can surface the wrong row, the channel-equality
+            # check below misses, and we send instead of editing.
             prior = await registry.get_live_event_by_fingerprint(
-                event["source_slug"], fingerprint
+                event["source_slug"], fingerprint, channel_id=channel.get("id")
             )
         except Exception as exc:  # registry-client is best-effort but be defensive
             logger.warning("fingerprint lookup raised: %s", exc)

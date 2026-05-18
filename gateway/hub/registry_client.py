@@ -148,17 +148,29 @@ class RegistryClient:
         r.raise_for_status()
 
     async def get_live_event_by_fingerprint(
-        self, source_slug: str, fingerprint: str
+        self,
+        source_slug: str,
+        fingerprint: str,
+        channel_id: str | None = None,
     ) -> dict | None:
         """Query MC for latest live event matching (source_slug, fingerprint).
 
         Returns event dict (with provider_message_id, channel_id) or None.
         Best-effort: returns None on any non-200 / network error (never raises).
+
+        Task 3.5b: passing `channel_id` filters MC's delivery JOIN to that
+        channel. Without it, an event with both inbox_mc + telegram deliveries
+        can surface the wrong delivery row → pipeline channel-equality check
+        fails → fallback to send instead of edit. Pipeline always passes the
+        dispatch channel's id so the returned row matches.
         """
+        params: dict[str, str] = {"source": source_slug, "fingerprint": fingerprint}
+        if channel_id:
+            params["channel"] = channel_id
         try:
             resp = await self._client.get(
                 f"{self.base_url}/api/board/notifications/events/by-fingerprint",
-                params={"source": source_slug, "fingerprint": fingerprint},
+                params=params,
                 headers={"Authorization": f"Bearer {self.token}"},
                 timeout=5.0,
             )
@@ -166,9 +178,10 @@ class RegistryClient:
             return resp.json().get("event")
         except Exception as exc:  # broad on purpose — never propagate
             logger.warning(
-                "get_live_event_by_fingerprint failed (%s/%s): %s",
+                "get_live_event_by_fingerprint failed (%s/%s/%s): %s",
                 source_slug,
                 fingerprint,
+                channel_id,
                 exc,
             )
             return None
