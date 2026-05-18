@@ -137,6 +137,86 @@ async def test_send_renders_v4c_payload(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_edit_calls_editMessageText_with_renderer(monkeypatch) -> None:
+    """edit() POSTs to editMessageText with rendered v4c text and returns status='edited'."""
+    monkeypatch.setenv("TELEGRAM_HERMES_BOT_TOKEN", "testtok")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 42, "edit_date": 1}})
+
+    adapter = make_adapter(handler)
+    event = {
+        "render_version": "v4c",
+        "severity": "warn",
+        "title": "T2",
+        "body": "B2",
+        "service": "drobo-backup",
+    }
+    result = await adapter.edit(
+        event=event,
+        channel={"type": "telegram", "target_ref": "12345"},
+        message_id="42",
+    )
+
+    assert captured["path"] == "/bottesttok/editMessageText"
+    assert captured["body"]["chat_id"] == "12345"
+    assert captured["body"]["message_id"] == 42
+    assert captured["body"]["parse_mode"] == "MarkdownV2"
+    assert "*T2*" in captured["body"]["text"]
+    assert result.status == "edited"
+    assert result.provider_message_id == "42"
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_edit_treats_message_not_modified_as_success(monkeypatch) -> None:
+    """Telegram 400 'message is not modified' is idempotent success — must NOT raise."""
+    monkeypatch.setenv("TELEGRAM_HERMES_BOT_TOKEN", "testtok")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "ok": False,
+                "error_code": 400,
+                "description": "Bad Request: message is not modified",
+            },
+        )
+
+    adapter = make_adapter(handler)
+    result = await adapter.edit(
+        event={"render_version": "v4c", "severity": "info", "title": "X", "body": "Y"},
+        channel={"target_ref": "12345"},
+        message_id="99",
+    )
+    assert result.status == "edited"
+    assert result.provider_message_id == "99"
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_edit_raises_on_unrecoverable_error(monkeypatch) -> None:
+    """Non-recoverable errors (e.g. 403) MUST raise so pipeline can fall back to send."""
+    monkeypatch.setenv("TELEGRAM_HERMES_BOT_TOKEN", "testtok")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"ok": False, "description": "Forbidden"})
+
+    adapter = make_adapter(handler)
+    with pytest.raises(AdapterDeliveryError) as exc_info:
+        await adapter.edit(
+            event={"render_version": "v4c", "severity": "info", "title": "X", "body": "Y"},
+            channel={"target_ref": "12345"},
+            message_id="99",
+        )
+    assert exc_info.value.status == 403
+    await adapter.close()
+
+
+@pytest.mark.asyncio
 async def test_send_v4a_still_returns_plain_body(monkeypatch) -> None:
     """v4a render_version → legacy plain body (no v4c sections)."""
     monkeypatch.setenv("TELEGRAM_HERMES_BOT_TOKEN", "test-token")

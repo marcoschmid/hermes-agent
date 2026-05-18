@@ -147,6 +147,32 @@ class RegistryClient:
         r = await self._client.post("/api/board/notifications/audit", json=kwargs)
         r.raise_for_status()
 
+    async def get_live_event_by_fingerprint(
+        self, source_slug: str, fingerprint: str
+    ) -> dict | None:
+        """Query MC for latest live event matching (source_slug, fingerprint).
+
+        Returns event dict (with provider_message_id, channel_id) or None.
+        Best-effort: returns None on any non-200 / network error (never raises).
+        """
+        try:
+            resp = await self._client.get(
+                f"{self.base_url}/api/board/notifications/events/by-fingerprint",
+                params={"source": source_slug, "fingerprint": fingerprint},
+                headers={"Authorization": f"Bearer {self.token}"},
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            return resp.json().get("event")
+        except Exception as exc:  # broad on purpose — never propagate
+            logger.warning(
+                "get_live_event_by_fingerprint failed (%s/%s): %s",
+                source_slug,
+                fingerprint,
+                exc,
+            )
+            return None
+
     async def persist_deliveries(self, event_id: str, deliveries: list[dict]) -> None:
         """Persist dispatch results to MC (v4d-A Phase 0.5).
 

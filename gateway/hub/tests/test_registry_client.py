@@ -139,3 +139,62 @@ async def test_persist_deliveries_swallows_http_500() -> None:
     rc = make_client(handler)
     await rc.persist_deliveries(event_id="evt_1", deliveries=[{"channel_id": "ch_x", "status": "delivered"}])
     await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_live_event_by_fingerprint_returns_event() -> None:
+    """Happy path: 200 + event dict → returns event dict."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        captured["auth"] = request.headers.get("authorization", "")
+        return httpx.Response(
+            200,
+            json={
+                "event": {
+                    "id": "evt_42",
+                    "provider_message_id": "777",
+                    "channel_id": "ch_x",
+                }
+            },
+        )
+
+    rc = make_client(handler)
+    result = await rc.get_live_event_by_fingerprint("drobo-backup", "fp123")
+
+    assert "/events/by-fingerprint" in captured["path"]
+    assert captured["params"]["source"] == "drobo-backup"
+    assert captured["params"]["fingerprint"] == "fp123"
+    assert "Bearer test-token" in captured["auth"]
+    assert result == {
+        "id": "evt_42",
+        "provider_message_id": "777",
+        "channel_id": "ch_x",
+    }
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_live_event_by_fingerprint_null_event_returns_none() -> None:
+    """200 + {event: null} → returns None."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"event": None})
+
+    rc = make_client(handler)
+    result = await rc.get_live_event_by_fingerprint("src", "fp")
+    assert result is None
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_live_event_by_fingerprint_network_error_returns_none() -> None:
+    """Best-effort: network error → returns None, does NOT raise."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.HTTPError("MC down")
+
+    rc = make_client(handler)
+    result = await rc.get_live_event_by_fingerprint("src", "fp")
+    assert result is None
+    await rc.close()
