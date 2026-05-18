@@ -20,6 +20,7 @@ import logging
 from dataclasses import dataclass
 
 from gateway.hub.adapter_registry import AdapterResult, get_adapter
+from gateway.hub.adapters.errors import AdapterDeliveryError
 from gateway.hub.cooldown import is_in_cooldown, record_cooldown
 from gateway.hub.dedupe import check_dedup
 from gateway.hub.dev_guard import is_dev_source
@@ -211,6 +212,61 @@ async def validate_scope(
     )
 
 
+async def _dispatch_one_channel(
+    adapter,
+    channel: dict,
+    event: dict,
+    registry: RegistryClient,
+) -> AdapterResult:
+    """Dispatch one channel: edit-in-place if a live prior event exists for
+    the same fingerprint AND its delivery was on THIS channel; otherwise send.
+
+    v4d-A core. Edit-failure falls back to send() so a transient Telegram
+    400 (message deleted / >48h / not-modified-but-not-mapped) never drops
+    the notification. Channel-id match is enforced so a prior telegram-only
+    event does not accidentally edit when the new firing also fans out to
+    inbox_mc (multi-channel safety).
+    """
+    fingerprint = event.get("fingerprint")
+    if fingerprint:
+        try:
+            prior = await registry.get_live_event_by_fingerprint(
+                event["source_slug"], fingerprint
+            )
+        except Exception as exc:  # registry-client is best-effort but be defensive
+            logger.warning("fingerprint lookup raised: %s", exc)
+            prior = None
+        if (
+            prior
+            and prior.get("provider_message_id")
+            and prior.get("channel_id") == channel.get("id")
+            and hasattr(adapter, "edit")
+        ):
+            try:
+                return await adapter.edit(
+                    event=event,
+                    channel=channel,
+                    message_id=prior["provider_message_id"],
+                )
+            except AdapterDeliveryError as exc:
+                logger.warning(
+                    "edit_failed_falling_back_to_send: source=%s channel=%s error=%s",
+                    event.get("source_slug"), channel.get("id"), exc,
+                )
+                # fall through to send()
+            except Exception as exc:  # noqa: BLE001 — never drop a notification
+                logger.warning(
+                    "edit_unexpected_error_falling_back_to_send: source=%s channel=%s error=%s",
+                    event.get("source_slug"), channel.get("id"), exc,
+                )
+                # fall through to send()
+
+    try:
+        return await adapter.send(event, channel)
+    except Exception as exc:  # noqa: BLE001 — preserve prior behaviour
+        return AdapterResult(status="failed", error=str(exc))
+
+
 async def run_pipeline(
     intent: NotificationIntent,
     source_token_hash: str,
@@ -378,10 +434,12 @@ async def run_pipeline(
         if adapter is None:
             r = AdapterResult(status="failed", error=f"No adapter for channel_type={ch_type}")
         else:
-            try:
-                r = await adapter.send(event_dict, channel)
-            except Exception as e:
-                r = AdapterResult(status="failed", error=str(e))
+            r = await _dispatch_one_channel(
+                adapter=adapter,
+                channel=channel,
+                event=event_dict,
+                registry=registry,
+            )
         results.append(r)
         deliveries.append(DeliveryResult(
             channel_id=channel_id,
@@ -390,17 +448,20 @@ async def run_pipeline(
             latency_ms=r.latency_ms,
         ))
 
+        # "edited" (v4d-A fingerprint-edit-in-place) is a successful delivery
+        # for audit + cooldown purposes; surfaced as "sent" in the audit-stream
+        # so downstream dashboards keep their existing event-name contract.
         await _safe_audit(registry,
             event_id=None, actor="hermes-dispatcher",
-            action="sent" if r.status == "delivered" else "failed",
+            action="sent" if r.status in ("delivered", "edited") else "failed",
             entity_type="channel", entity_id=channel_id,
             reason=r.error,
         )
-        if r.status == "delivered" and channel_id:
+        if r.status in ("delivered", "edited") and channel_id:
             record_cooldown(ctx.source["id"], channel_id, ctx.topic["id"])
 
-    # Aggregate status
-    delivered_count = sum(1 for r in results if r.status == "delivered")
+    # Aggregate status — both "delivered" and "edited" (v4d-A) count as success.
+    delivered_count = sum(1 for r in results if r.status in ("delivered", "edited"))
     if delivered_count == len(results) and len(results) > 0:
         agg_status = "delivered"
     elif delivered_count == 0:
@@ -414,7 +475,10 @@ async def run_pipeline(
     # provider_message_id; all other channels return adapter-native ids.
     mc_event_id: str | None = None
     for member, r in zip(members, results):
-        if member.get("channel", {}).get("type") == "inbox_mc" and r.status == "delivered":
+        if (
+            member.get("channel", {}).get("type") == "inbox_mc"
+            and r.status in ("delivered", "edited")
+        ):
             mc_event_id = r.provider_message_id
             break
 

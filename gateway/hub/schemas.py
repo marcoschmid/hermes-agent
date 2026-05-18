@@ -37,7 +37,10 @@ class NotificationIntent(BaseModel):
 
 class DeliveryResult(BaseModel):
     channel_id: str
-    status: Literal["pending", "delivered", "failed", "fallback_used"]
+    # "edited" surfaces from TelegramAdapter.edit (v4d-A fingerprint-edit).
+    # MC normalises it to "delivered" server-side via DeliveryStatusInput;
+    # aggregate logic in run_pipeline treats edited and delivered as equivalent.
+    status: Literal["pending", "delivered", "edited", "failed", "fallback_used"]
     provider_message_id: Optional[str] = None
     latency_ms: Optional[int] = None
 
