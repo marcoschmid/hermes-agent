@@ -9,6 +9,7 @@ from typing import Optional
 
 from fastapi import FastAPI
 
+from gateway.hub.mount import register_hub_routes
 from gateway.paperclip_notify import NotifyDeliveryError, build_router
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,7 @@ def _make_telegram_sender(target: Optional[str]):
 
 def build_app(target: Optional[str] = None) -> FastAPI:
     app = FastAPI(title="paperclip-notify", version="1")
+    register_hub_routes(app)
     app.include_router(build_router(telegram_send=_make_telegram_sender(target)))
 
     @app.get("/health")
