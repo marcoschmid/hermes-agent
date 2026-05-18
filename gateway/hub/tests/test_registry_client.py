@@ -1,5 +1,6 @@
 """Tests for gateway.hub.registry_client."""
 import json
+from unittest.mock import MagicMock, patch
 import pytest
 import httpx
 from gateway.hub.registry_client import RegistryClient
@@ -91,4 +92,50 @@ async def test_post_audit() -> None:
     rc = make_client(handler)
     await rc.post_audit(event_id="evt_1", actor="hermes-dispatcher", action="rule_matched")
     assert captured["body"]["actor"] == "hermes-dispatcher"
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_persist_deliveries_posts_to_mc() -> None:
+    """persist_deliveries POSTs deliveries array to MC route for given event_id."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        captured["auth"] = request.headers.get("authorization", "")
+        return httpx.Response(200, json={"ok": True, "count": 1})
+
+    rc = make_client(handler)
+    deliveries = [
+        {"channel_id": "ch_x", "status": "delivered", "provider_message_id": "42", "latency_ms": 100},
+    ]
+    await rc.persist_deliveries(event_id="evt_1", deliveries=deliveries)
+
+    assert "/events/evt_1/deliveries" in captured["path"]
+    assert captured["body"] == {"deliveries": deliveries}
+    assert "Bearer test-token" in captured["auth"]
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_persist_deliveries_swallows_errors_non_blocking() -> None:
+    """Persistence is best-effort; failures must NOT raise."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.HTTPError("MC down")
+
+    rc = make_client(handler)
+    # Should NOT raise — must return cleanly even on transport error
+    await rc.persist_deliveries(event_id="evt_1", deliveries=[])
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_persist_deliveries_swallows_http_500() -> None:
+    """Non-2xx response (raise_for_status) must also be swallowed."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    rc = make_client(handler)
+    await rc.persist_deliveries(event_id="evt_1", deliveries=[{"channel_id": "ch_x", "status": "delivered"}])
     await rc.close()

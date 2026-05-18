@@ -408,6 +408,16 @@ async def run_pipeline(
     else:
         agg_status = "partial"
 
+    # v4d-A Phase 0.5: extract MC event_id from the inbox_mc delivery so the
+    # API layer can persist per-channel dispatch results back to MC. The
+    # InboxMcAdapter returns the freshly-created MC event_id as its
+    # provider_message_id; all other channels return adapter-native ids.
+    mc_event_id: str | None = None
+    for member, r in zip(members, results):
+        if member.get("channel", {}).get("type") == "inbox_mc" and r.status == "delivered":
+            mc_event_id = r.provider_message_id
+            break
+
     # T4: Write durable audit-row to hub_events_log if state was provided.
     # status maps: delivered → delivered_inbox; failed → failed; partial → failed
     # (Phase v4a status enum is coarser than NotificationResult — refined v4b)
@@ -428,6 +438,7 @@ async def run_pipeline(
             logger.warning("hub_events_log insert failed: %s", exc)
 
     return NotificationResult(
+        event_id=mc_event_id,
         status=agg_status,
         rule_matched=rule.get("slug"),
         deliveries=deliveries,
