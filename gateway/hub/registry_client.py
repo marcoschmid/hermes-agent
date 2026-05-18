@@ -5,11 +5,14 @@ Uses httpx.AsyncClient with shared lifespan for connection pooling.
 5-min TTL cache for source/topic/rules/channel-set lookups.
 """
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import Any
 import httpx
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BASE = "http://127.0.0.1:3334"
 CACHE_TTL_SECONDS = 300
@@ -143,3 +146,66 @@ class RegistryClient:
     async def post_audit(self, **kwargs) -> None:
         r = await self._client.post("/api/board/notifications/audit", json=kwargs)
         r.raise_for_status()
+
+    async def get_live_event_by_fingerprint(
+        self,
+        source_slug: str,
+        fingerprint: str,
+        channel_id: str | None = None,
+    ) -> dict | None:
+        """Query MC for latest live event matching (source_slug, fingerprint).
+
+        Returns event dict (with provider_message_id, channel_id) or None.
+        Best-effort: returns None on any non-200 / network error (never raises).
+
+        Task 3.5b: passing `channel_id` filters MC's delivery JOIN to that
+        channel. Without it, an event with both inbox_mc + telegram deliveries
+        can surface the wrong delivery row → pipeline channel-equality check
+        fails → fallback to send instead of edit. Pipeline always passes the
+        dispatch channel's id so the returned row matches.
+        """
+        params: dict[str, str] = {"source": source_slug, "fingerprint": fingerprint}
+        if channel_id:
+            params["channel"] = channel_id
+        try:
+            resp = await self._client.get(
+                f"{self.base_url}/api/board/notifications/events/by-fingerprint",
+                params=params,
+                headers={"Authorization": f"Bearer {self.token}"},
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            return resp.json().get("event")
+        except Exception as exc:  # broad on purpose — never propagate
+            logger.warning(
+                "get_live_event_by_fingerprint failed (%s/%s/%s): %s",
+                source_slug,
+                fingerprint,
+                channel_id,
+                exc,
+            )
+            return None
+
+    async def persist_deliveries(self, event_id: str, deliveries: list[dict]) -> None:
+        """Persist dispatch results to MC (v4d-A Phase 0.5).
+
+        POSTs to /api/board/notifications/events/:id/deliveries so the
+        fingerprint -> provider_message_id round-trip exists in MC-DB for
+        subsequent edit-in-place firings.
+
+        Best-effort: errors are logged but never raised — MC persistence
+        failure must not break the Hub-response to senders. MC normalises
+        "edited" -> "delivered" server-side for the CHECK constraint.
+        """
+        try:
+            resp = await self._client.post(
+                f"{self.base_url}/api/board/notifications/events/{event_id}/deliveries",
+                json={"deliveries": deliveries},
+                headers={"Authorization": f"Bearer {self.token}"},
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+        except Exception as exc:  # broad on purpose — never propagate
+            logger.warning(
+                "persist_deliveries failed for event %s: %s", event_id, exc,
+            )

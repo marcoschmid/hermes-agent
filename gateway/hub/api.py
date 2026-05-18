@@ -176,11 +176,12 @@ async def notifications(request: Request) -> dict:
             },
         )
 
+    registry = get_registry()
     try:
         result = await run_pipeline(
             intent,
             source_token_hash="",  # HMAC is the auth-of-truth; pipeline-side check is v4b
-            registry=get_registry(),
+            registry=registry,
             state=await get_hub_state(),  # T4: write durable event-log row
         )
     except PipelineError as exc:
@@ -188,5 +189,15 @@ async def notifications(request: Request) -> dict:
             status_code=exc.status_code,
             detail={"error_code": exc.error_code, "message": exc.message},
         ) from exc
+
+    # v4d-A Phase 0.5: persist per-channel dispatch results to MC so the
+    # fingerprint -> provider_message_id round-trip exists for edit-in-place
+    # lookups on subsequent firings. Best-effort: never blocks the response.
+    if result.event_id and result.deliveries:
+        deliveries_payload = [d.model_dump(exclude_none=False) for d in result.deliveries]
+        await registry.persist_deliveries(
+            event_id=result.event_id,
+            deliveries=deliveries_payload,
+        )
 
     return {"data": result.model_dump(exclude_none=True)}

@@ -1,5 +1,6 @@
 """Tests for gateway.hub.registry_client."""
 import json
+from unittest.mock import MagicMock, patch
 import pytest
 import httpx
 from gateway.hub.registry_client import RegistryClient
@@ -91,4 +92,158 @@ async def test_post_audit() -> None:
     rc = make_client(handler)
     await rc.post_audit(event_id="evt_1", actor="hermes-dispatcher", action="rule_matched")
     assert captured["body"]["actor"] == "hermes-dispatcher"
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_persist_deliveries_posts_to_mc() -> None:
+    """persist_deliveries POSTs deliveries array to MC route for given event_id."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        captured["auth"] = request.headers.get("authorization", "")
+        return httpx.Response(200, json={"ok": True, "count": 1})
+
+    rc = make_client(handler)
+    deliveries = [
+        {"channel_id": "ch_x", "status": "delivered", "provider_message_id": "42", "latency_ms": 100},
+    ]
+    await rc.persist_deliveries(event_id="evt_1", deliveries=deliveries)
+
+    assert "/events/evt_1/deliveries" in captured["path"]
+    assert captured["body"] == {"deliveries": deliveries}
+    assert "Bearer test-token" in captured["auth"]
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_persist_deliveries_swallows_errors_non_blocking() -> None:
+    """Persistence is best-effort; failures must NOT raise."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.HTTPError("MC down")
+
+    rc = make_client(handler)
+    # Should NOT raise — must return cleanly even on transport error
+    await rc.persist_deliveries(event_id="evt_1", deliveries=[])
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_persist_deliveries_swallows_http_500() -> None:
+    """Non-2xx response (raise_for_status) must also be swallowed."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    rc = make_client(handler)
+    await rc.persist_deliveries(event_id="evt_1", deliveries=[{"channel_id": "ch_x", "status": "delivered"}])
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_live_event_by_fingerprint_returns_event() -> None:
+    """Happy path: 200 + event dict → returns event dict."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        captured["auth"] = request.headers.get("authorization", "")
+        return httpx.Response(
+            200,
+            json={
+                "event": {
+                    "id": "evt_42",
+                    "provider_message_id": "777",
+                    "channel_id": "ch_x",
+                }
+            },
+        )
+
+    rc = make_client(handler)
+    result = await rc.get_live_event_by_fingerprint("drobo-backup", "fp123")
+
+    assert "/events/by-fingerprint" in captured["path"]
+    assert captured["params"]["source"] == "drobo-backup"
+    assert captured["params"]["fingerprint"] == "fp123"
+    assert "Bearer test-token" in captured["auth"]
+    assert result == {
+        "id": "evt_42",
+        "provider_message_id": "777",
+        "channel_id": "ch_x",
+    }
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_live_event_by_fingerprint_null_event_returns_none() -> None:
+    """200 + {event: null} → returns None."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"event": None})
+
+    rc = make_client(handler)
+    result = await rc.get_live_event_by_fingerprint("src", "fp")
+    assert result is None
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_live_event_by_fingerprint_network_error_returns_none() -> None:
+    """Best-effort: network error → returns None, does NOT raise."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.HTTPError("MC down")
+
+    rc = make_client(handler)
+    result = await rc.get_live_event_by_fingerprint("src", "fp")
+    assert result is None
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_live_event_by_fingerprint_plumbs_channel_param() -> None:
+    """Task 3.5b: channel_id arg → ?channel=… in request query string.
+
+    Verifies the hub passes the dispatch channel through to MC so MC's
+    delivery JOIN is filtered to the same channel — otherwise a multi-
+    delivery event surfaces the wrong row and edit-in-place misses.
+    """
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={
+                "event": {
+                    "id": "evt_42",
+                    "provider_message_id": "tg-mid",
+                    "channel_id": "ch_tg_marco",
+                }
+            },
+        )
+
+    rc = make_client(handler)
+    await rc.get_live_event_by_fingerprint(
+        "drobo-backup", "fp123", channel_id="ch_tg_marco"
+    )
+
+    assert captured["params"]["source"] == "drobo-backup"
+    assert captured["params"]["fingerprint"] == "fp123"
+    assert captured["params"]["channel"] == "ch_tg_marco"
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_live_event_by_fingerprint_omits_channel_when_not_passed() -> None:
+    """Backwards-compat: no channel_id → no ?channel= in request."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"event": None})
+
+    rc = make_client(handler)
+    await rc.get_live_event_by_fingerprint("src", "fp")
+    assert "channel" not in captured["params"]
     await rc.close()

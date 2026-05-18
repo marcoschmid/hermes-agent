@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from gateway.hub.adapters.errors import AdapterDeliveryError
+from gateway.hub.renderers.telegram_v4c import render as render_v4c
 
 _MARKDOWN_V2_SPECIALS = set("_*[]()~`>#+-=|{}.!" + "\\")
 
@@ -39,10 +40,10 @@ class TelegramAdapter:
 
         token = self._resolve_token()
         chat_id = self._resolve_chat_id(channel)
-        body = self._message_body(event)
+        text = render_v4c(event)
         payload = {
             "chat_id": chat_id,
-            "text": escape_markdown_v2(body),
+            "text": text,
             "parse_mode": "MarkdownV2",
         }
         started = time.perf_counter()
@@ -70,6 +71,60 @@ class TelegramAdapter:
             provider_message_id=str(message_id) if message_id is not None else None,
             latency_ms=latency_ms,
         )
+
+    async def edit(self, event: dict, channel: dict, message_id: str):
+        """Edit existing Telegram message via editMessageText.
+
+        Mirrors send() but targets an existing message_id. Returns
+        AdapterResult(status="edited", provider_message_id=message_id).
+
+        Raises AdapterDeliveryError for unrecoverable errors so the pipeline
+        can fall back to send(). Telegram's 400 "message is not modified"
+        is treated as idempotent success.
+        """
+        from gateway.hub.adapter_registry import AdapterResult
+
+        token = self._resolve_token()
+        chat_id = self._resolve_chat_id(channel)
+        text = render_v4c(event)
+        payload = {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "text": text,
+            "parse_mode": "MarkdownV2",
+        }
+        started = time.perf_counter()
+
+        try:
+            response = await self._client.post(
+                f"https://api.telegram.org/bot{token}/editMessageText",
+                json=payload,
+                timeout=self._timeout,
+            )
+        except httpx.TimeoutException as exc:
+            raise AdapterDeliveryError("timeout", str(exc)) from exc
+        except httpx.HTTPError as exc:
+            raise AdapterDeliveryError("network", str(exc)) from exc
+
+        latency_ms = int((time.perf_counter() - started) * 1000)
+
+        if response.status_code == 200:
+            return AdapterResult(
+                status="edited",
+                provider_message_id=str(message_id),
+                latency_ms=latency_ms,
+            )
+
+        # Telegram returns 400 for "message is not modified" — idempotent success
+        body_text = response.text
+        if response.status_code == 400 and "not modified" in body_text.lower():
+            return AdapterResult(
+                status="edited",
+                provider_message_id=str(message_id),
+                latency_ms=latency_ms,
+            )
+
+        raise AdapterDeliveryError(response.status_code, body_text)
 
     def _resolve_token(self) -> str:
         token = (
