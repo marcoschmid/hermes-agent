@@ -1,0 +1,12 @@
+# gitleaks false-positive baseline
+# Format: <commit-sha>:<file>:<rule-id>:<line>
+#
+# 2026-05-19: Baseline established for feature/notification-hub-phase-2 push.
+# All three findings are pre-existing false positives in earlier commits:
+#   - INTEGRATION.md: curl health-check example (no auth header)
+#   - MINIMAX_OAUTH_CLIENT_ID: public OAuth client identifier (not secret)
+#   - GLM_API_KEY test fixture: sanitizer-test string, not real key
+
+7e4daaed7b7974e8fb1aa228e30154ebb285b65b:gateway/hub/INTEGRATION.md:curl-auth-header:42
+9eb16025bd91cd018b6d370f10b9b8ef5b7812a5:hermes_cli/auth.py:generic-api-key:75
+88e07c42b44c6dcf62a56fbc891bd22ee3fab253:tests/hermes_cli/test_config.py:generic-api-key:333
