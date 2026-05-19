@@ -26,10 +26,14 @@ from gateway.hub.adapters.inbox_mc import InboxMcAdapter  # noqa: E402  (registr
 # TelegramAdapter wandert nach gateway/hub/adapters/telegram.py
 from gateway.hub.adapters.telegram import TelegramAdapter  # noqa: E402
 
+# PushoverAdapter (Phase 2)
+from gateway.hub.adapters.pushover import PushoverAdapter  # noqa: E402
+
 
 ADAPTER_MAP: dict[str, type] = {
     "inbox_mc": InboxMcAdapter,
     "telegram": TelegramAdapter,
+    "pushover": PushoverAdapter,
 }
 
 
