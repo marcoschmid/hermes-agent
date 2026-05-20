@@ -10,6 +10,7 @@ Routes:
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Optional
 
@@ -23,7 +24,46 @@ from gateway.hub.pipeline import PipelineError, run_pipeline
 from gateway.hub.registry_client import RegistryClient
 from gateway.hub.schemas import NotificationIntent
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+
+async def _audit_auth_failed(
+    error_code: str,
+    message: str,
+    source_slug: str | None = None,
+    request: Request | None = None,
+) -> None:
+    """Phase 2 finding fix: write audit row before raising auth-failure HTTPException.
+
+    Best-effort: any audit-push failure is swallowed (logged at WARN) so the
+    auth-rejection contract is never weakened by MC outages.
+    """
+    try:
+        registry = get_registry()
+        actor_ip = ""
+        if request is not None:
+            client = request.client
+            actor_ip = client.host if client else ""
+        await registry.post_audit(
+            actor="hub-auth",
+            action="auth_failed",
+            entity_type="source",
+            entity_id=source_slug or "(unknown)",
+            metadata={
+                "error_code": error_code,
+                "message": message,
+                "actor_ip": actor_ip,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "auth-failed audit-push failed (error_code=%s source=%s): %s",
+            error_code,
+            source_slug,
+            exc,
+        )
 
 # Module-level shared client; created lazily on first request.
 _registry: Optional[RegistryClient] = None
@@ -91,6 +131,11 @@ async def _authenticate(request: Request, body: bytes) -> str:
     nonce = request.headers.get("x-hub-nonce", "")
     sig = request.headers.get("x-hub-signature", "")
     if not (ts and nonce and sig):
+        await _audit_auth_failed(
+            "missing_auth",
+            "Bearer HUB_PILOT_TOKEN or X-Hub-* headers required",
+            request=request,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error_code": "missing_auth", "message": "Bearer HUB_PILOT_TOKEN or X-Hub-* headers required"},
@@ -99,12 +144,18 @@ async def _authenticate(request: Request, body: bytes) -> str:
     try:
         body_json = json.loads(body)
     except json.JSONDecodeError:
+        await _audit_auth_failed("bad_body", "Body is not valid JSON", request=request)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"error_code": "bad_body", "message": "Body is not valid JSON"},
         )
     source_slug = body_json.get("source_slug")
     if not source_slug:
+        await _audit_auth_failed(
+            "missing_source",
+            "source_slug required in body for HMAC auth",
+            request=request,
+        )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"error_code": "missing_source", "message": "source_slug required in body for HMAC auth"},
@@ -113,12 +164,24 @@ async def _authenticate(request: Request, body: bytes) -> str:
     # Fetch source.hub_secret via registry
     source = await get_registry().get_source(source_slug)
     if source is None:
+        await _audit_auth_failed(
+            "unknown_source",
+            f"Source {source_slug} not registered",
+            source_slug=source_slug,
+            request=request,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error_code": "unknown_source", "message": f"Source {source_slug} not registered"},
         )
     secret = source.get("hub_secret")
     if not secret:
+        await _audit_auth_failed(
+            "no_hub_secret",
+            f"Source {source_slug} has no hub_secret configured",
+            source_slug=source_slug,
+            request=request,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error_code": "no_hub_secret", "message": f"Source {source_slug} has no hub_secret configured"},
@@ -128,6 +191,12 @@ async def _authenticate(request: Request, body: bytes) -> str:
     try:
         hmac_verify(secret.encode(), ts, nonce, body, sig)
     except HmacError as exc:
+        await _audit_auth_failed(
+            exc.error_code,
+            exc.message,
+            source_slug=source_slug,
+            request=request,
+        )
         raise HTTPException(
             status_code=exc.status_code,
             detail={"error_code": exc.error_code, "message": exc.message},
@@ -136,6 +205,12 @@ async def _authenticate(request: Request, body: bytes) -> str:
     # Replay-check via nonce-store
     state = await get_hub_state()
     if not await remember_or_replay(state, nonce, source_slug):
+        await _audit_auth_failed(
+            "replay_detected",
+            f"Nonce {nonce} already used",
+            source_slug=source_slug,
+            request=request,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error_code": "replay_detected", "message": f"Nonce {nonce} already used"},
@@ -201,3 +276,110 @@ async def notifications(request: Request) -> dict:
         )
 
     return {"data": result.model_dump(exclude_none=True)}
+
+
+@router.post("/v1/notifications/simulate")
+async def simulate(request: Request) -> dict:
+    """Dry-run routing simulator (Phase 2).
+
+    Runs schema-validation + registry-lookup + source-scope-check + rule-match
+    against the same registry the real pipeline uses, but skips dedup,
+    cooldown, flapping, quiet-hours and dispatch. No adapter calls, no
+    nonce burn, no audit-rows written.
+
+    Use this to inspect *which* channels a candidate event would land on
+    before sending it. Suppression-states (dedup/cooldown/quiet) are
+    intentionally not simulated — they depend on runtime state and would
+    bias future real-runs if probed read-only here.
+    """
+    from gateway.hub.pipeline import (
+        PipelineError,
+        validate_and_lookup,
+        validate_scope,
+    )
+    from gateway.hub.rule_matcher import find_matching_rule
+
+    body = await request.body()
+    await _authenticate(request, body)
+
+    try:
+        body_json = json.loads(body)
+        intent = NotificationIntent.model_validate(body_json)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error_code": "schema_invalid", "message": str(exc)},
+        ) from exc
+
+    registry = get_registry()
+    trace: list[str] = ["received"]
+
+    try:
+        ctx = await validate_and_lookup(intent, "", registry)
+        trace.append("validated")
+    except PipelineError as exc:
+        return {
+            "data": {
+                "would_match_rule": None,
+                "would_deliver_to": [],
+                "suppression": {"reason": exc.error_code, "message": exc.message},
+                "audit_trace": trace,
+            }
+        }
+
+    try:
+        await validate_scope(intent, ctx, registry)
+        trace.append("scope_ok")
+    except PipelineError as exc:
+        return {
+            "data": {
+                "would_match_rule": None,
+                "would_deliver_to": [],
+                "suppression": {"reason": exc.error_code, "message": exc.message},
+                "audit_trace": trace,
+            }
+        }
+
+    rule, channel_set = await find_matching_rule(
+        registry,
+        topic=intent.topic,
+        audience_slug=ctx.audience_slug,
+        severity=intent.severity,
+        urgency=intent.urgency,
+        actionability=intent.actionability,
+        source_id=ctx.source["id"],
+    )
+    if rule is None or channel_set is None:
+        trace.append("no_rule_match")
+        return {
+            "data": {
+                "would_match_rule": None,
+                "would_deliver_to": [],
+                "suppression": {"reason": "no_rule_match"},
+                "audit_trace": trace,
+            }
+        }
+
+    trace.append("rule_matched")
+    would_deliver_to = []
+    for member in channel_set.get("members", []):
+        channel = member.get("channel", {}) or {}
+        if not channel.get("enabled", True):
+            continue
+        would_deliver_to.append(
+            {
+                "channel_id": channel.get("id"),
+                "channel_slug": channel.get("slug"),
+                "adapter": channel.get("type"),
+                "required": bool(member.get("required", False)),
+            }
+        )
+
+    return {
+        "data": {
+            "would_match_rule": rule.get("slug") or rule.get("id"),
+            "would_deliver_to": would_deliver_to,
+            "suppression": None,
+            "audit_trace": trace,
+        }
+    }
