@@ -1,28 +1,38 @@
 """Telegram callback receiver for Hermes notifications.
 
 Handles incoming webhook POSTs from Telegram Bot API:
-- verifies X-Telegram-Bot-Api-Secret-Token
-- parses callback_query payload
+- verifies X-Telegram-Bot-Api-Secret-Token (constant-time compare)
+- parses callback_query payload with defensive type-guards (graceful 400 on malformed)
 - persists callback row to telegram_callbacks SQLite table
 - enforces per-user rate-limit (in-memory ringbuffer, 60s sliding window)
-- returns CallbackResult dataclass (success/duplicate/ignored/rate_limited/secret-mismatch)
+- returns CallbackResult dataclass
 
 Out-of-scope: action dispatch (lives in mission-control / hermes-cron).
+
+Deployment note: rate-limit state is process-local. For multi-worker deploys
+behind a load-balancer, run as single worker OR migrate rate-buckets to
+SQLite/Redis. Current Hermes deploy is single-process so this is acceptable.
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import sqlite3
+import time
 from collections import deque
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
 SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
 KNOWN_CALLBACK_TYPES = frozenset({"approve", "reject", "skip"})
+BUSY_TIMEOUT_MS = 30000
+CONNECT_TIMEOUT_SECONDS = 30
+LOCK_RETRY_MAX = 5
+LOCK_RETRY_BASE_SLEEP = 0.1
 
 
 @dataclass(slots=True)
@@ -35,6 +45,20 @@ class CallbackResult:
     callback_type: str = ""
     issue_id: str = ""
     error: str = ""
+
+
+def _retry_on_locked(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Retry SQLite ops on 'database is locked' OperationalError."""
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        for attempt in range(LOCK_RETRY_MAX):
+            try:
+                return fn(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == LOCK_RETRY_MAX - 1:
+                    raise
+                time.sleep(LOCK_RETRY_BASE_SLEEP * (2 ** attempt))
+        raise RuntimeError("unreachable")
+    return wrapper
 
 
 class TelegramCallbackReceiver:
@@ -55,11 +79,17 @@ class TelegramCallbackReceiver:
             conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, isolation_level=None)
+        conn = sqlite3.connect(
+            self._db_path,
+            isolation_level=None,
+            timeout=CONNECT_TIMEOUT_SECONDS,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         return conn
 
+    @_retry_on_locked
     def handle_webhook(self, *,
                        headers: dict[str, str],
                        payload: dict[str, Any],
@@ -67,25 +97,35 @@ class TelegramCallbackReceiver:
         now = now or _utcnow()
 
         provided = headers.get(SECRET_HEADER) or headers.get(SECRET_HEADER.lower())
-        if provided != self._secret:
+        if not hmac.compare_digest(provided or "", self._secret):
             return CallbackResult(
                 accepted=False, status_code=401, error="invalid_secret",
             )
 
-        callback = payload.get("callback_query") or {}
+        if not isinstance(payload, dict):
+            return CallbackResult(
+                accepted=False, status_code=400, error="payload_not_object",
+            )
+
+        callback = _as_dict(payload.get("callback_query"))
         callback_id = str(callback.get("id") or "")
         if not callback_id:
             return CallbackResult(
                 accepted=False, status_code=400, error="missing_callback_id",
             )
 
-        user_id = str((callback.get("from") or {}).get("id") or "")
+        from_obj = _as_dict(callback.get("from"))
+        user_id = str(from_obj.get("id") or "")
         callback_data = str(callback.get("data") or "")
-        update_id = int(payload.get("update_id") or 0)
-        message = callback.get("message") or {}
-        chat = message.get("chat") or {}
+        update_id = _as_int(payload.get("update_id"))
+        if update_id is None:
+            return CallbackResult(
+                accepted=False, status_code=400, error="invalid_update_id",
+            )
+        message = _as_dict(callback.get("message"))
+        chat = _as_dict(message.get("chat"))
         chat_id = str(chat.get("id") or "")
-        message_id = int(message.get("message_id") or 0)
+        message_id = _as_int(message.get("message_id")) or 0
 
         if user_id not in self._allowed:
             return CallbackResult(
@@ -137,7 +177,6 @@ class TelegramCallbackReceiver:
                      accepted_flag, error_msg),
                 )
             except sqlite3.IntegrityError:
-                # Race: concurrent webhook for same callback_id won the INSERT
                 row = conn.execute(
                     "SELECT callback_type, accepted FROM telegram_callbacks "
                     "WHERE callback_id=?",
@@ -202,3 +241,22 @@ def _iso(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.isoformat()
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Coerce nested payload field to dict — defensive against malformed input."""
+    return value if isinstance(value, dict) else {}
+
+
+def _as_int(value: Any) -> int | None:
+    """Coerce numeric-looking field to int. Returns None on non-numeric input."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
