@@ -1,23 +1,39 @@
 """Persistent outbox for Hermes notification delivery.
 
 SQLite-backed queue with idempotent enqueue (via dedup_key UNIQUE),
-FIFO claim_due, mark_sent, and record_failure with exponential backoff
-and dead-letter after 5 failures.
+FIFO claim_due with atomic status transition, mark_sent, and
+record_failure with exponential backoff and dead-letter after 5 failures.
+
+Concurrency model:
+- enqueue: INSERT OR IGNORE + re-select (race-safe via UNIQUE dedup_key)
+- claim_due: atomic UPDATE...RETURNING transitions 'pending' -> 'claimed'
+- record_failure: 'claimed' -> 'pending' (with backoff) or 'dead-lettered'
+- mark_sent: 'claimed' -> 'sent'
+
+Zombie 'claimed' rows after worker crash require offline recovery (out of scope).
 """
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+import time
 import uuid
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 
 DEAD_LETTER_THRESHOLD = 5
 BACKOFF_BASE_SECONDS = 30
 BACKOFF_MAX_SECONDS = 3600
+BUSY_TIMEOUT_MS = 30000
+CONNECT_TIMEOUT_SECONDS = 30
+LOCK_RETRY_MAX = 5
+LOCK_RETRY_BASE_SLEEP = 0.1
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -34,6 +50,20 @@ class OutboxRow:
     updated_at: str
 
 
+def _retry_on_locked(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Retry SQLite operations on 'database is locked' OperationalError."""
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        for attempt in range(LOCK_RETRY_MAX):
+            try:
+                return fn(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == LOCK_RETRY_MAX - 1:
+                    raise
+                time.sleep(LOCK_RETRY_BASE_SLEEP * (2 ** attempt))
+        raise RuntimeError("unreachable")
+    return wrapper
+
+
 class OutboxStore:
     """SQLite-backed outbox queue with dedup + retry + dead-letter."""
 
@@ -46,12 +76,18 @@ class OutboxStore:
             conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, isolation_level=None)
+        conn = sqlite3.connect(
+            self._db_path,
+            isolation_level=None,
+            timeout=CONNECT_TIMEOUT_SECONDS,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         return conn
 
+    @_retry_on_locked
     def enqueue(self, *,
                 channel: str,
                 dedup_key: str,
@@ -59,45 +95,45 @@ class OutboxStore:
                 payload: dict[str, Any] | None = None,
                 now: datetime | None = None,
                 **_ignored: Any) -> OutboxRow:
-        """Idempotent insert. If dedup_key exists, returns existing row."""
+        """Idempotent insert via dedup_key UNIQUE. Returns existing or new row."""
         if payload_json is None and payload is not None:
             payload_json = json.dumps(payload, sort_keys=True)
         if payload_json is None:
             raise ValueError("enqueue requires payload or payload_json")
         ts = _iso(now or _utcnow())
+        row_id = uuid.uuid4().hex
 
         with closing(self._conn()) as conn:
-            existing = conn.execute(
-                "SELECT * FROM outbox WHERE dedup_key=?", (dedup_key,)
-            ).fetchone()
-            if existing:
-                return _row_to_dataclass(existing)
-
-            row_id = uuid.uuid4().hex
             conn.execute(
-                "INSERT INTO outbox (id, channel, payload_json, dedup_key, "
+                "INSERT OR IGNORE INTO outbox (id, channel, payload_json, dedup_key, "
                 "attempts, last_error, status, next_retry_at, created_at, updated_at) "
                 "VALUES (?,?,?,?,0,NULL,'pending',?,?,?)",
                 (row_id, channel, payload_json, dedup_key, ts, ts, ts),
             )
-            return OutboxRow(
-                id=row_id, channel=channel, payload_json=payload_json,
-                dedup_key=dedup_key, attempts=0, last_error=None,
-                status="pending", next_retry_at=ts,
-                created_at=ts, updated_at=ts,
-            )
+            row = conn.execute(
+                "SELECT * FROM outbox WHERE dedup_key=?", (dedup_key,)
+            ).fetchone()
+            return _row_to_dataclass(row)
 
+    @_retry_on_locked
     def claim_due(self, *, now: datetime, limit: int = 10) -> list[OutboxRow]:
-        """Return rows with status='pending' AND next_retry_at <= now, FIFO."""
+        """Atomically claim FIFO 'pending' rows due now. Transitions to 'claimed'."""
         ts = _iso(now)
         with closing(self._conn()) as conn:
             cursor = conn.execute(
-                "SELECT * FROM outbox WHERE status='pending' AND next_retry_at<=? "
-                "ORDER BY created_at ASC, id ASC LIMIT ?",
-                (ts, limit),
+                "UPDATE outbox SET status='claimed', updated_at=? "
+                "WHERE id IN ("
+                "  SELECT id FROM outbox "
+                "  WHERE status='pending' AND next_retry_at<=? "
+                "  ORDER BY created_at ASC, id ASC LIMIT ?"
+                ") RETURNING *",
+                (ts, ts, limit),
             )
-            return [_row_to_dataclass(r) for r in cursor.fetchall()]
+            rows = [_row_to_dataclass(r) for r in cursor.fetchall()]
+            rows.sort(key=lambda r: (r.created_at, r.id))
+            return rows
 
+    @_retry_on_locked
     def mark_sent(self, *,
                   row_id: str | None = None,
                   id: str | None = None,
@@ -109,11 +145,14 @@ class OutboxStore:
             raise ValueError("mark_sent requires row_id|id|message_id")
         ts = _iso(now or _utcnow())
         with closing(self._conn()) as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE outbox SET status='sent', updated_at=? WHERE id=?",
                 (ts, rid),
             )
+            if cursor.rowcount == 0:
+                logger.warning("outbox.mark_sent missing row_id=%s", rid)
 
+    @_retry_on_locked
     def record_failure(self, *,
                        row_id: str | None = None,
                        id: str | None = None,
@@ -132,6 +171,7 @@ class OutboxStore:
         with closing(self._conn()) as conn:
             row = conn.execute("SELECT attempts FROM outbox WHERE id=?", (rid,)).fetchone()
             if row is None:
+                logger.warning("outbox.record_failure missing row_id=%s", rid)
                 return
             attempts = (row["attempts"] or 0) + 1
             if attempts >= DEAD_LETTER_THRESHOLD:
@@ -139,7 +179,10 @@ class OutboxStore:
                 next_retry = None
             else:
                 new_status = "pending"
-                backoff_sec = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** (attempts - 1)))
+                backoff_sec = min(
+                    BACKOFF_MAX_SECONDS,
+                    BACKOFF_BASE_SECONDS * (2 ** (attempts - 1)),
+                )
                 next_retry = _iso(now_dt + timedelta(seconds=backoff_sec))
 
             conn.execute(
@@ -172,9 +215,9 @@ def _utcnow() -> datetime:
 
 
 def _iso(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.isoformat()
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise ValueError("timezone-aware datetime required")
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 def _row_to_dataclass(row: sqlite3.Row) -> OutboxRow:
