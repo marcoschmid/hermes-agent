@@ -271,11 +271,16 @@ def auth_add_command(args) -> None:
         # Clear any existing suppression marker so a re-link after `hermes auth
         # remove openai-codex` works without the new tokens being skipped.
         auth_mod.unsuppress_credential_source(provider, "device_code")
-        creds = auth_mod._codex_device_code_login()
+        creds = auth_mod._codex_device_code_login(
+            client_id=getattr(args, "client_id", None),
+            scope=getattr(args, "scope", None),
+            timeout_seconds=getattr(args, "timeout", None),
+        )
         label = (getattr(args, "label", None) or "").strip() or label_from_token(
             creds["tokens"]["access_token"],
             _oauth_default_label(provider, len(pool.entries()) + 1),
         )
+        requested_scope = creds.get("scope")
         entry = PooledCredential(
             provider=provider,
             id=uuid.uuid4().hex[:6],
@@ -287,6 +292,7 @@ def auth_add_command(args) -> None:
             refresh_token=creds["tokens"].get("refresh_token"),
             base_url=creds.get("base_url"),
             last_refresh=creds.get("last_refresh"),
+            extra={"scope": requested_scope} if isinstance(requested_scope, str) and requested_scope.strip() else {},
         )
         pool.add_entry(entry)
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')

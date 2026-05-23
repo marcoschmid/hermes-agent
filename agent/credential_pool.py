@@ -626,6 +626,8 @@ class CredentialPool:
                         tokens["refresh_token"] = entry.refresh_token
                     if entry.last_refresh:
                         state["last_refresh"] = entry.last_refresh
+                    if entry.extra.get("scope"):
+                        state["scope"] = entry.extra.get("scope")
                     _save_provider_state(auth_store, "openai-codex", state)
 
                 else:
@@ -679,6 +681,9 @@ class CredentialPool:
                     refresh_token=refreshed["refresh_token"],
                     last_refresh=refreshed.get("last_refresh"),
                 )
+                if refreshed.get("scope"):
+                    updated.extra = dict(updated.extra or {})
+                    updated.extra["scope"] = refreshed.get("scope")
             elif self.provider == "nous":
                 synced = self._sync_nous_entry_from_auth_store(entry)
                 if synced is not entry:

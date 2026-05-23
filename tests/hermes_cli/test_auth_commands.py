@@ -235,13 +235,14 @@ def test_auth_add_codex_oauth_persists_pool_entry(tmp_path, monkeypatch):
     token = _jwt_with_email("codex@example.com")
     monkeypatch.setattr(
         "hermes_cli.auth._codex_device_code_login",
-        lambda: {
+        lambda **kwargs: {
             "tokens": {
                 "access_token": token,
                 "refresh_token": "refresh-token",
             },
             "base_url": "https://chatgpt.com/backend-api/codex",
             "last_refresh": "2026-03-23T10:00:00Z",
+            "scope": kwargs.get("scope"),
         },
     )
 
@@ -252,6 +253,9 @@ def test_auth_add_codex_oauth_persists_pool_entry(tmp_path, monkeypatch):
         auth_type = "oauth"
         api_key = None
         label = None
+        client_id = None
+        scope = None
+        timeout = None
 
     auth_add_command(_Args())
 
@@ -262,6 +266,49 @@ def test_auth_add_codex_oauth_persists_pool_entry(tmp_path, monkeypatch):
     assert entry["source"] == "manual:device_code"
     assert entry["refresh_token"] == "refresh-token"
     assert entry["base_url"] == "https://chatgpt.com/backend-api/codex"
+
+
+def test_auth_add_codex_oauth_passes_scope_to_device_login(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+    token = _jwt_with_email("codex@example.com")
+    captured = {}
+
+    def _fake_codex_login(**kwargs):
+        captured.update(kwargs)
+        return {
+            "tokens": {
+                "access_token": token,
+                "refresh_token": "refresh-token",
+            },
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "last_refresh": "2026-03-23T10:00:00Z",
+            "scope": "openid profile email offline_access api.model.images.request",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth._codex_device_code_login", _fake_codex_login)
+
+    from hermes_cli.auth_commands import auth_add_command
+
+    class _Args:
+        provider = "openai-codex"
+        auth_type = "oauth"
+        api_key = None
+        label = None
+        client_id = "app-test"
+        scope = "api.model.images.request"
+        timeout = 123
+
+    auth_add_command(_Args())
+
+    assert captured == {
+        "client_id": "app-test",
+        "scope": "api.model.images.request",
+        "timeout_seconds": 123,
+    }
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entry = payload["credential_pool"]["openai-codex"][0]
+    assert entry["scope"] == "openid profile email offline_access api.model.images.request"
 
 
 def test_auth_remove_reindexes_priorities(tmp_path, monkeypatch):
@@ -1067,7 +1114,7 @@ def test_auth_add_codex_clears_suppression_marker(tmp_path, monkeypatch):
     token = _jwt_with_email("codex@example.com")
     monkeypatch.setattr(
         "hermes_cli.auth._codex_device_code_login",
-        lambda: {
+        lambda **kwargs: {
             "tokens": {
                 "access_token": token,
                 "refresh_token": "refreshed",
@@ -1084,6 +1131,9 @@ def test_auth_add_codex_clears_suppression_marker(tmp_path, monkeypatch):
         auth_type = "oauth"
         api_key = None
         label = None
+        client_id = None
+        scope = None
+        timeout = None
 
     auth_add_command(_Args())
 

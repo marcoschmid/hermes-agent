@@ -89,6 +89,7 @@ STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
+CODEX_OAUTH_DEFAULT_SCOPES = ("openid", "profile", "email", "offline_access")
 QWEN_OAUTH_CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56"
 QWEN_OAUTH_TOKEN_URL = "https://chat.qwen.ai/api/v1/oauth2/token"
 QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
@@ -2230,7 +2231,7 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     }
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None) -> None:
+def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, scope: str = None) -> None:
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -2240,6 +2241,8 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None) -> None
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = "chatgpt"
+        if isinstance(scope, str) and scope.strip():
+            state["scope"] = scope.strip()
         _save_provider_state(auth_store, "openai-codex", state)
         _save_auth_store(auth_store)
 
@@ -2345,6 +2348,9 @@ def refresh_codex_oauth_pure(
     next_refresh = refresh_payload.get("refresh_token")
     if isinstance(next_refresh, str) and next_refresh.strip():
         updated["refresh_token"] = next_refresh.strip()
+    granted_scope = refresh_payload.get("scope")
+    if isinstance(granted_scope, str) and granted_scope.strip():
+        updated["scope"] = granted_scope.strip()
     return updated
 
 
@@ -2365,7 +2371,7 @@ def _refresh_codex_auth_tokens(
     updated_tokens["access_token"] = refreshed["access_token"]
     updated_tokens["refresh_token"] = refreshed["refresh_token"]
 
-    _save_codex_tokens(updated_tokens)
+    _save_codex_tokens(updated_tokens, scope=refreshed.get("scope"))
     return updated_tokens
 
 
@@ -2445,6 +2451,7 @@ def resolve_codex_runtime_credentials(
         "source": "hermes-auth-store",
         "last_refresh": data.get("last_refresh"),
         "auth_mode": "chatgpt",
+        "scope": data.get("scope"),
     }
 
 
@@ -3925,7 +3932,10 @@ def _login_openai_codex(
 ) -> None:
     """OpenAI Codex login via device code flow. Tokens stored in ~/.hermes/auth.json."""
 
-    del args, pconfig  # kept for parity with other provider login helpers
+    del pconfig  # kept for parity with other provider login helpers
+    requested_client_id = getattr(args, "client_id", None)
+    requested_scope = getattr(args, "scope", None)
+    requested_timeout = getattr(args, "timeout", None)
 
     # Check for existing Hermes-owned credentials
     if not force_new_login:
@@ -3979,10 +3989,14 @@ def _login_openai_codex(
     print("(Hermes creates its own session — won't affect Codex CLI or VS Code)")
     print()
 
-    creds = _codex_device_code_login()
+    creds = _codex_device_code_login(
+        client_id=requested_client_id,
+        scope=requested_scope,
+        timeout_seconds=requested_timeout,
+    )
 
     # Save tokens to Hermes auth store
-    _save_codex_tokens(creds["tokens"], creds.get("last_refresh"))
+    _save_codex_tokens(creds["tokens"], creds.get("last_refresh"), creds.get("scope"))
     config_path = _update_config_for_provider("openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))
     print()
     print("Login successful!")
@@ -3991,19 +4005,50 @@ def _login_openai_codex(
     print(f"  Config updated: {config_path} (model.provider=openai-codex)")
 
 
-def _codex_device_code_login() -> Dict[str, Any]:
+def _codex_scope_string(raw_scope: Optional[str]) -> Optional[str]:
+    """Return a Codex OAuth scope string, preserving the current default flow.
+
+    OpenAI's Codex device-auth endpoint historically grants the standard
+    identity/refresh scopes when no scope is sent.  When a caller asks for an
+    extra API scope (for example ``api.model.images.request``), include the
+    identity defaults explicitly so the resulting token can still be labelled
+    and refreshed by Hermes.
+    """
+    if not isinstance(raw_scope, str) or not raw_scope.strip():
+        return None
+    ordered: List[str] = []
+    seen = set()
+    for scope in (*CODEX_OAUTH_DEFAULT_SCOPES, *raw_scope.split()):
+        scope = scope.strip()
+        if not scope or scope in seen:
+            continue
+        seen.add(scope)
+        ordered.append(scope)
+    return " ".join(ordered) if ordered else None
+
+
+def _codex_device_code_login(
+    *,
+    client_id: Optional[str] = None,
+    scope: Optional[str] = None,
+    timeout_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
     """Run the OpenAI device code login flow and return credentials dict."""
     import time as _time
 
     issuer = "https://auth.openai.com"
-    client_id = CODEX_OAUTH_CLIENT_ID
+    client_id = (client_id or CODEX_OAUTH_CLIENT_ID).strip() or CODEX_OAUTH_CLIENT_ID
+    requested_scope = _codex_scope_string(scope)
 
     # Step 1: Request device code
     try:
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+            usercode_body = {"client_id": client_id}
+            if requested_scope:
+                usercode_body["scope"] = requested_scope
             resp = client.post(
                 f"{issuer}/api/accounts/deviceauth/usercode",
-                json={"client_id": client_id},
+                json=usercode_body,
                 headers={"Content-Type": "application/json"},
             )
     except Exception as exc:
@@ -4038,7 +4083,8 @@ def _codex_device_code_login() -> Dict[str, Any]:
     print("Waiting for sign-in... (press Ctrl+C to cancel)")
 
     # Step 3: Poll for authorization code
-    max_wait = 15 * 60  # 15 minutes
+    max_wait = int(timeout_seconds) if timeout_seconds else 15 * 60  # default: 15 minutes
+    max_wait = max(60, max_wait)
     start = _time.monotonic()
     code_resp = None
 
@@ -4133,6 +4179,7 @@ def _codex_device_code_login() -> Dict[str, Any]:
         "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "auth_mode": "chatgpt",
         "source": "device-code",
+        "scope": tokens.get("scope") or requested_scope,
     }
 
 

@@ -17,6 +17,8 @@ from hermes_cli.auth import (
     _save_codex_tokens,
     _import_codex_cli_tokens,
     _login_openai_codex,
+    _codex_device_code_login,
+    _codex_scope_string,
     get_codex_auth_status,
     get_provider_auth_state,
     refresh_codex_oauth_pure,
@@ -228,6 +230,77 @@ def _patch_httpx(monkeypatch, response):
     monkeypatch.setattr("hermes_cli.auth.httpx.Client", _factory)
 
 
+def test_codex_scope_string_adds_identity_defaults():
+    assert _codex_scope_string("api.model.images.request") == (
+        "openid profile email offline_access api.model.images.request"
+    )
+    assert _codex_scope_string("openid api.model.images.request") == (
+        "openid profile email offline_access api.model.images.request"
+    )
+    assert _codex_scope_string(None) is None
+
+
+def test_codex_device_code_login_sends_requested_scope(monkeypatch):
+    captured = {"posts": []}
+
+    class _SequencedClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            captured["posts"].append({"url": url, **kwargs})
+            if url.endswith("/api/accounts/deviceauth/usercode"):
+                return _StubHTTPResponse(
+                    200,
+                    {
+                        "user_code": "ABCD-EFGH",
+                        "device_auth_id": "dev-123",
+                        "interval": "3",
+                    },
+                )
+            if url.endswith("/api/accounts/deviceauth/token"):
+                return _StubHTTPResponse(
+                    200,
+                    {
+                        "authorization_code": "auth-code",
+                        "code_verifier": "verifier",
+                    },
+                )
+            if url.endswith("/oauth/token"):
+                return _StubHTTPResponse(
+                    200,
+                    {
+                        "access_token": "access-token",
+                        "refresh_token": "refresh-token",
+                        "scope": "openid profile email offline_access api.model.images.request",
+                    },
+                )
+            raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr("hermes_cli.auth.httpx.Client", _SequencedClient)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    creds = _codex_device_code_login(
+        client_id="app-test",
+        scope="api.model.images.request",
+        timeout_seconds=60,
+    )
+
+    first = captured["posts"][0]
+    assert first["json"] == {
+        "client_id": "app-test",
+        "scope": "openid profile email offline_access api.model.images.request",
+    }
+    assert creds["tokens"]["access_token"] == "access-token"
+    assert creds["scope"] == "openid profile email offline_access api.model.images.request"
+
+
 def test_refresh_parses_openai_nested_error_shape_refresh_token_reused(monkeypatch):
     """OpenAI returns {"error": {"code": "refresh_token_reused", "message": "..."}}
     — parser must surface relogin_required and the dedicated message.
@@ -328,17 +401,19 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
     )
     monkeypatch.setattr(
         "hermes_cli.auth._codex_device_code_login",
-        lambda: {
+        lambda **kwargs: {
             "tokens": {"access_token": "fresh-at", "refresh_token": "fresh-rt"},
             "last_refresh": "2026-04-01T00:00:00Z",
             "base_url": DEFAULT_CODEX_BASE_URL,
+            "scope": kwargs.get("scope"),
         },
     )
 
-    def _fake_save(tokens, last_refresh=None):
+    def _fake_save(tokens, last_refresh=None, scope=None):
         called["device_login"] += 1
         called["tokens"] = dict(tokens)
         called["last_refresh"] = last_refresh
+        called["scope"] = scope
 
     monkeypatch.setattr("hermes_cli.auth._save_codex_tokens", _fake_save)
     monkeypatch.setattr("hermes_cli.auth._update_config_for_provider", lambda *args, **kwargs: "/tmp/config.yaml")
