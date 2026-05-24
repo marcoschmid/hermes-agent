@@ -304,8 +304,10 @@ def make_default_router(
     source_slug: str,
     target_chat_id: str,
     context: str,
+    hub_auth_mode: Literal["bearer", "hmac"] = "bearer",
     hub_url_env: str = "HERMES_HUB_URL",
     hub_token_env: str = "HERMES_HUB_BEARER_TOKEN",
+    hub_hmac_secret_env: str = "HERMES_HUB_HMAC_SECRET",
     hub_allowed_hosts_env: str = "HERMES_HUB_ALLOWED_HOSTS",
     mc_url_env: str = "MC_HUB_URL",
     mc_token_env: str = "MC_HUB_TOKEN",
@@ -319,6 +321,11 @@ def make_default_router(
 
     Tokens resolved at send-time so rotation/late-binding works.
     URLs validated against allowlists (loopback default; override via *_ALLOWED_HOSTS env).
+
+    Hub auth modes:
+    - ``bearer`` (default, Pilot/transitional): Hub accepts only HUB_PILOT_TOKEN.
+    - ``hmac`` (v4b production): per-source HMAC-SHA256 — secret read from
+      ``hub_hmac_secret_env`` at send-time, must match MC source-registry hub_secret.
     """
     hub_url = os.environ.get(hub_url_env) or DEFAULT_HUB_URL
     mc_url = os.environ.get(mc_url_env) or DEFAULT_MC_URL
@@ -326,14 +333,18 @@ def make_default_router(
     hub_allowed = _resolve_allowed_hosts(hub_allowed_hosts_env)
     mc_allowed = _resolve_allowed_hosts(mc_allowed_hosts_env)
 
-    hub_sender = make_hub_sender(
-        hub_url=hub_url,
-        auth_mode="bearer",
-        bearer_token_env=hub_token_env,
-        source_slug=source_slug,
-        topic=topic,
-        allowed_hosts=hub_allowed,
-    )
+    hub_sender_kwargs: dict[str, Any] = {
+        "hub_url": hub_url,
+        "auth_mode": hub_auth_mode,
+        "source_slug": source_slug,
+        "topic": topic,
+        "allowed_hosts": hub_allowed,
+    }
+    if hub_auth_mode == "bearer":
+        hub_sender_kwargs["bearer_token_env"] = hub_token_env
+    else:
+        hub_sender_kwargs["hmac_secret_env"] = hub_hmac_secret_env
+    hub_sender = make_hub_sender(**hub_sender_kwargs)
     mc_sender = make_mc_sender(
         mc_url=mc_url,
         bearer_token_env=mc_token_env,
