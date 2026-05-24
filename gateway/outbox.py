@@ -134,6 +134,32 @@ class OutboxStore:
             return rows
 
     @_retry_on_locked
+    def get_by_id(self, row_id: str) -> OutboxRow | None:
+        """Return current row state (post-dispatch status-check)."""
+        with closing(self._conn()) as conn:
+            row = conn.execute(
+                "SELECT * FROM outbox WHERE id=?", (row_id,)
+            ).fetchone()
+            return _row_to_dataclass(row) if row else None
+
+    @_retry_on_locked
+    def recover_zombies(self, *, now: datetime, timeout_seconds: int) -> int:
+        """Reset claimed-stuck rows (worker-crash mid-dispatch) back to pending.
+
+        Atomically transitions claimed -> pending for rows where
+        updated_at < now - timeout_seconds. Returns count recovered.
+        """
+        cutoff = _iso(now - timedelta(seconds=timeout_seconds))
+        with closing(self._conn()) as conn:
+            cursor = conn.execute(
+                "UPDATE outbox SET status='pending', updated_at=? "
+                "WHERE status='claimed' AND updated_at < ? "
+                "RETURNING id",
+                (_iso(now), cutoff),
+            )
+            return len(cursor.fetchall())
+
+    @_retry_on_locked
     def mark_sent(self, *,
                   row_id: str | None = None,
                   id: str | None = None,
