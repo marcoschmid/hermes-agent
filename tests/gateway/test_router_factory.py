@@ -466,3 +466,62 @@ def test_make_default_router_token_rotation_observed(monkeypatch, tmp_path):
         result2 = router.send(message="m2", issue={"id": "wk-2"})
     assert result2.hop == "hermes"
     assert mock_post.call_args.kwargs["headers"]["Authorization"] == "Bearer hub-rotated"
+
+
+def test_make_default_router_hmac_mode_signs_with_x_hub_headers(monkeypatch, tmp_path):
+    """HMAC mode: per-source secret from env, X-Hub-* headers, no Bearer."""
+    fake_script = tmp_path / "safe_telegram_send.sh"
+    fake_script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_script.chmod(0o755)
+    run_log = tmp_path / "router-run-log.jsonl"
+
+    monkeypatch.setenv("WEEKLY_PREVIEW_HUB_HMAC_SECRET", "8e2fd0c566cf02bd")
+    monkeypatch.setenv("MC_HUB_TOKEN", "mc-tok")
+    monkeypatch.setenv("SAFE_TELEGRAM_SEND_SCRIPT", str(fake_script))
+
+    router = make_default_router(
+        source_slug="weekly-preview",
+        target_chat_id="128314698",
+        context="weekly-preview",
+        hub_auth_mode="hmac",
+        hub_hmac_secret_env="WEEKLY_PREVIEW_HUB_HMAC_SECRET",
+        run_log_path=str(run_log),
+    )
+
+    with patch("gateway.router_factory.requests.post", return_value=_hub_success(event_id="evt-hmac")) as mock_post:
+        result = router.send(message="hmac smoke", issue={"id": "wk-1", "title": "T"})
+
+    assert result.ok is True
+    assert result.hop == "hermes"
+    headers = mock_post.call_args.kwargs["headers"]
+    assert "Authorization" not in headers
+    assert headers["X-Hub-Timestamp"]
+    assert headers["X-Hub-Nonce"]
+    assert len(headers["X-Hub-Signature"]) == 64
+
+
+def test_make_default_router_hmac_mode_missing_secret_cascades_to_mc(monkeypatch, tmp_path):
+    """HMAC mode: secret missing -> hub stage fails, cascade to MC."""
+    fake_script = tmp_path / "safe_telegram_send.sh"
+    fake_script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_script.chmod(0o755)
+    run_log = tmp_path / "router-run-log.jsonl"
+
+    monkeypatch.delenv("WEEKLY_PREVIEW_HUB_HMAC_SECRET", raising=False)
+    monkeypatch.setenv("MC_HUB_TOKEN", "mc-tok")
+    monkeypatch.setenv("SAFE_TELEGRAM_SEND_SCRIPT", str(fake_script))
+
+    router = make_default_router(
+        source_slug="weekly-preview",
+        target_chat_id="128314698",
+        context="weekly-preview",
+        hub_auth_mode="hmac",
+        hub_hmac_secret_env="WEEKLY_PREVIEW_HUB_HMAC_SECRET",
+        run_log_path=str(run_log),
+    )
+
+    with patch("gateway.router_factory.requests.post", return_value=_mc_success(event_id="mc-h")):
+        result = router.send(message="m", issue={"id": "wk-1"})
+
+    assert result.ok is True
+    assert result.hop == "mission-control"
