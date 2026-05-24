@@ -72,6 +72,10 @@ class NotificationWorker:
         stats.claimed = len(rows)
 
         for row in rows:
+            if self._shutdown_event.is_set():
+                log.info("shutdown requested mid-batch — abandoning %d remaining rows "
+                         "(will be re-claimed via zombie-recovery)", stats.claimed - stats.sent - stats.failed)
+                break
             self._dispatch_row(row, now=now, stats=stats)
 
         return stats
@@ -81,7 +85,8 @@ class NotificationWorker:
             router = self._router_factory(row.channel)
         except Exception as exc:
             log.exception("router_factory failed for channel=%s row=%s", row.channel, row.id)
-            self._record_failure(row.id, f"router_factory: {exc}", now=now, stats=stats)
+            self._record_failure(row.id, row.claim_token, f"router_factory: {exc}",
+                                 now=now, stats=stats)
             return
 
         message, issue = _payload_to_router_args(row)
@@ -90,19 +95,40 @@ class NotificationWorker:
             result: SendResult = router.send(message=message, issue=issue)
         except Exception as exc:
             log.exception("router.send raised for row=%s", row.id)
-            self._record_failure(row.id, str(exc), now=now, stats=stats)
+            self._record_failure(row.id, row.claim_token, str(exc), now=now, stats=stats)
             return
 
         if result.ok:
-            self._outbox.mark_sent(row_id=row.id, now=now)
-            stats.sent += 1
+            sent_ok = self._outbox.mark_sent(
+                row_id=row.id, claim_token=row.claim_token, now=now,
+            )
+            if sent_ok:
+                stats.sent += 1
+            else:
+                # Stale claim — another worker reclaimed; don't double-count
+                log.warning("mark_sent stale for row=%s — likely reclaimed", row.id)
+                stats.failed += 1
             return
 
         err = result.error or f"cascade-failed at {result.hop}"
-        self._record_failure(row.id, err, now=now, stats=stats)
+        self._record_failure(row.id, row.claim_token, err, now=now, stats=stats)
 
-    def _record_failure(self, row_id: str, error: str, *, now: datetime, stats: CycleStats) -> None:
-        self._outbox.record_failure(row_id=row_id, error=error, now=now)
+    def _record_failure(
+        self,
+        row_id: str,
+        claim_token: str | None,
+        error: str,
+        *,
+        now: datetime,
+        stats: CycleStats,
+    ) -> None:
+        applied = self._outbox.record_failure(
+            row_id=row_id, claim_token=claim_token, error=error, now=now,
+        )
+        if not applied:
+            # Stale claim or row vanished — count as failure but don't re-check
+            stats.failed += 1
+            return
         refreshed = self._outbox.get_by_id(row_id)
         if refreshed and refreshed.status == "dead-lettered":
             stats.dead_lettered += 1

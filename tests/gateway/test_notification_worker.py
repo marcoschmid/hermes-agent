@@ -174,13 +174,17 @@ def test_worker_dead_letters_row_after_fifth_failure(tmp_path: Path):
 
 
 def test_worker_recovers_zombie_claimed_rows(tmp_path: Path):
+    """Round-2: zombie recovery counts as failed attempt with backoff.
+    Cycle 1: recover 1 zombie (attempts=1, pending with backoff).
+    Cycle 2 (post-backoff): re-claim + dispatch.
+    """
     store = _make_store(tmp_path)
     enq_time = datetime(2026, 5, 24, 12, 0, tzinfo=timezone.utc)
     _enqueue_telegram(store, dedup_key="d-zombie", now=enq_time)
-    # Simulate prior worker-crash: claim, then leave stuck
+    # Simulate prior worker-crash: claim, leave stuck
     store.claim_due(now=enq_time, limit=10)
 
-    # New worker session 10min later (zombie_timeout=300=5min)
+    # First cycle: 10min later. Zombie-recovery sets attempts=1 + 30s backoff.
     crash_time = enq_time + timedelta(minutes=10)
     router = _make_router(ok=True)
     worker = NotificationWorker(
@@ -189,11 +193,15 @@ def test_worker_recovers_zombie_claimed_rows(tmp_path: Path):
         zombie_timeout_seconds=300,
     )
 
-    stats = worker.run_once(now=crash_time)
+    stats1 = worker.run_once(now=crash_time)
+    assert stats1.zombie_recovered == 1
+    assert stats1.claimed == 0  # not yet eligible (backoff active)
 
-    assert stats.zombie_recovered == 1
-    assert stats.claimed == 1  # re-claimed after zombie-reset
-    assert stats.sent == 1
+    # Second cycle: past backoff
+    past_backoff = crash_time + timedelta(minutes=5)
+    stats2 = worker.run_once(now=past_backoff)
+    assert stats2.claimed == 1
+    assert stats2.sent == 1
 
 
 # ---- multi-row batch -------------------------------------------------------
@@ -299,3 +307,48 @@ def test_payload_to_router_args_handles_legacy_freeform_payload():
     message, issue = _payload_to_router_args(row)
     assert message == "just a string body, not JSON"
     assert issue["id"] == "row-2"
+
+
+# ---- Round-2 fence tests ----------------------------------------------------
+
+
+def test_worker_passes_claim_token_to_mark_sent(tmp_path: Path):
+    """Round-2: mark_sent receives claim_token so stale workers fenced out."""
+    store = _make_store(tmp_path)
+    enq_time = datetime(2026, 5, 24, 12, 0, tzinfo=timezone.utc)
+    _enqueue_telegram(store, dedup_key="d-fence-1", now=enq_time)
+    router = _make_router(ok=True)
+    worker = NotificationWorker(outbox=store, router_factory=MagicMock(return_value=router))
+
+    stats = worker.run_once(now=enq_time)
+    assert stats.sent == 1
+    # If claim_token wiring was broken, mark_sent would silently fail-stale
+    # and stats.sent would be 0 / stats.failed=1
+
+
+def test_worker_stops_dispatching_mid_batch_on_shutdown(tmp_path: Path):
+    """Round-2 MEDIUM-4: SIGTERM should abandon remaining batch rows."""
+    import threading
+
+    store = _make_store(tmp_path)
+    enq_time = datetime(2026, 5, 24, 12, 0, tzinfo=timezone.utc)
+    for i in range(5):
+        _enqueue_telegram(store, dedup_key=f"d-shut-{i}", now=enq_time)
+
+    shutdown_invoked = {"flag": False}
+
+    def slow_router(_ch: str) -> FallbackNotificationRouter:
+        # On first call, signal shutdown then return slow-success
+        if not shutdown_invoked["flag"]:
+            shutdown_invoked["flag"] = True
+            worker.stop()
+        r = MagicMock(spec=FallbackNotificationRouter)
+        r.send.return_value = SendResult(ok=True, hop="hermes")
+        return r
+
+    worker = NotificationWorker(outbox=store, router_factory=slow_router)
+
+    stats = worker.run_once(now=enq_time)
+    assert stats.claimed == 5
+    assert stats.sent == 1  # First row sent before shutdown noticed
+    # Remaining 4 rows untouched (will be zombie-recovered later)

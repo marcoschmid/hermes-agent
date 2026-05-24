@@ -101,14 +101,27 @@ def _claim_due(store: Any, *, now: datetime, limit: int = 10) -> list[Any]:
     return list(result or [])
 
 
-def _mark_sent(store: Any, row_id: str, *, now: datetime | None = None) -> None:
-    _call_method(store, "mark_sent", row_id=row_id, message_id=row_id, id=row_id, now=now)
+def _force_claim(store: Any, row_id: str) -> str | None:
+    """Helper: set status='claimed' via claim_due, return claim_token."""
+    # Read current claim_token via direct DB query so tests pre-Round-2 also work
+    rows = _call_method(store, "claim_due", now=datetime(2099, 1, 1, tzinfo=timezone.utc), limit=100)
+    for r in rows:
+        if getattr(r, "id", None) == row_id or (isinstance(r, dict) and r.get("id") == row_id):
+            return getattr(r, "claim_token", None) if not isinstance(r, dict) else r.get("claim_token")
+    return None
+
+
+def _mark_sent(store: Any, row_id: str, *, claim_token: str | None = None,
+               now: datetime | None = None) -> None:
+    _call_method(store, "mark_sent", row_id=row_id, message_id=row_id, id=row_id,
+                 claim_token=claim_token, now=now)
 
 
 def _record_failure(
     store: Any,
     row_id: str,
     *,
+    claim_token: str | None = None,
     error: str = "telegram 500",
     now: datetime | None = None,
 ) -> None:
@@ -118,6 +131,7 @@ def _record_failure(
         row_id=row_id,
         message_id=row_id,
         id=row_id,
+        claim_token=claim_token,
         error=error,
         last_error=error,
         now=now,
@@ -213,9 +227,17 @@ def test_outbox_read_claims_due_rows_fifo(tmp_path: Path):
 
 def test_outbox_mark_sent_updates_status(tmp_path: Path):
     store, db_path = _make_store(tmp_path)
-    row_id = _result_id(_enqueue(store, dedup_key="sent-me"), db_path, "sent-me")
+    enq_time = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    row_id = _result_id(
+        _enqueue(store, dedup_key="sent-me", now=enq_time), db_path, "sent-me"
+    )
 
-    _mark_sent(store, row_id, now=datetime(2026, 5, 12, 12, 5, tzinfo=timezone.utc))
+    # Round-2: mark_sent requires status='claimed' (claim first)
+    claimed = _claim_due(store, now=enq_time, limit=10)
+    token = _result_value(claimed[0], "claim_token")
+
+    _mark_sent(store, row_id, claim_token=token,
+               now=datetime(2026, 5, 12, 12, 5, tzinfo=timezone.utc))
 
     row = _row_by_id(db_path, row_id)
     assert row["status"] == "sent"
@@ -224,10 +246,16 @@ def test_outbox_mark_sent_updates_status(tmp_path: Path):
 
 def test_outbox_retry_counter_records_failure_and_backoff(tmp_path: Path):
     store, db_path = _make_store(tmp_path)
-    row_id = _result_id(_enqueue(store, dedup_key="retry-me"), db_path, "retry-me")
+    enq_time = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
+    row_id = _result_id(
+        _enqueue(store, dedup_key="retry-me", now=enq_time), db_path, "retry-me"
+    )
     now = datetime(2026, 5, 12, 12, 10, tzinfo=timezone.utc)
 
-    _record_failure(store, row_id, error="telegram 500", now=now)
+    claimed = _claim_due(store, now=now, limit=10)
+    token = _result_value(claimed[0], "claim_token")
+
+    _record_failure(store, row_id, claim_token=token, error="telegram 500", now=now)
 
     row = _row_by_id(db_path, row_id)
     assert row["attempts"] == 1
@@ -243,11 +271,20 @@ def test_outbox_dead_letters_after_fifth_failure(tmp_path: Path):
     now = datetime(2026, 5, 12, 12, 20, tzinfo=timezone.utc)
 
     for attempt in range(5):
+        # Force re-claim for each failure (record_failure resets to pending)
+        cycle_time = now + timedelta(hours=attempt)  # past any backoff
+        # Reset next_retry_at to make row eligible
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE outbox SET status='pending', next_retry_at=?, claim_token=NULL WHERE id=?",
+                         (cycle_time.isoformat(), row_id))
+        claimed = _claim_due(store, now=cycle_time, limit=10)
+        token = _result_value(claimed[0], "claim_token") if claimed else None
         _record_failure(
             store,
             row_id,
+            claim_token=token,
             error=f"telegram failure {attempt}",
-            now=now + timedelta(minutes=attempt),
+            now=cycle_time,
         )
 
     row = _row_by_id(db_path, row_id)
@@ -316,17 +353,43 @@ def test_outbox_recover_zombies_resets_old_claimed_rows(tmp_path: Path):
     enq_time = datetime(2026, 5, 24, 12, 0, tzinfo=timezone.utc)
     _enqueue(store, dedup_key="zombie-1", now=enq_time)
 
-    # Simulate claim_due (transitions to 'claimed' at enq_time)
     claimed = store.claim_due(now=enq_time, limit=10)
     assert len(claimed) == 1
 
-    # Simulate worker-crash: now+10min, zombie_timeout=5min → should recover
+    # Worker-crash: now+10min, zombie_timeout=5min → recover as failed attempt
     now_after_crash = enq_time + timedelta(minutes=10)
     recovered = store.recover_zombies(now=now_after_crash, timeout_seconds=300)
 
     assert recovered == 1
     row = store.get_by_id(claimed[0].id)
-    assert row.status == "pending"
+    assert row.status == "pending"  # 1st recovery → pending (attempts=1, not yet dead)
+    assert row.attempts == 1  # Round-2: zombie counts as failed attempt
+    assert row.last_error == "zombie recovered"
+    assert row.claim_token is None
+
+
+def test_outbox_recover_zombies_dead_letters_after_threshold(tmp_path: Path):
+    """Round-2: zombie at attempts=4 (5th recovery) → dead-lettered, not infinite-retry."""
+    store, db_path = _make_store(tmp_path)
+    enq_time = datetime(2026, 5, 24, 12, 0, tzinfo=timezone.utc)
+    row = _enqueue(store, dedup_key="zombie-deadletter", now=enq_time)
+    row_id = row.id
+
+    # Pre-set attempts=4 to simulate 4 prior failures
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE outbox SET attempts=4, status='claimed', updated_at=? WHERE id=?",
+            (enq_time.isoformat(), row_id),
+        )
+
+    # 10min later, zombie_timeout=5min
+    now_after_crash = enq_time + timedelta(minutes=10)
+    recovered = store.recover_zombies(now=now_after_crash, timeout_seconds=300)
+
+    assert recovered == 1
+    refreshed = store.get_by_id(row_id)
+    assert refreshed.status == "dead-lettered"
+    assert refreshed.attempts == 5
 
 
 def test_outbox_recover_zombies_skips_recent_claimed_rows(tmp_path: Path):
@@ -340,3 +403,61 @@ def test_outbox_recover_zombies_skips_recent_claimed_rows(tmp_path: Path):
     recovered = store.recover_zombies(now=now_recent, timeout_seconds=300)
 
     assert recovered == 0
+
+
+def test_mark_sent_rejects_stale_claim_token(tmp_path: Path):
+    """Round-2 HIGH-2: stale worker cannot mark_sent row that was reclaimed."""
+    store, db_path = _make_store(tmp_path)
+    enq_time = datetime(2026, 5, 24, 12, 0, tzinfo=timezone.utc)
+    _enqueue(store, dedup_key="fence-mark", now=enq_time)
+
+    # First claim
+    claim1 = store.claim_due(now=enq_time, limit=10)[0]
+    stale_token = claim1.claim_token
+
+    # Simulate other worker recovery + reclaim with new token
+    recovery_time = enq_time + timedelta(minutes=10)
+    store.recover_zombies(now=recovery_time, timeout_seconds=300)
+    # Force re-eligible
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE outbox SET status='pending', next_retry_at=?, claim_token=NULL WHERE id=?",
+                     (recovery_time.isoformat(), claim1.id))
+    claim2 = store.claim_due(now=recovery_time, limit=10)[0]
+    fresh_token = claim2.claim_token
+
+    assert stale_token != fresh_token
+
+    # Stale worker tries to mark_sent with old token → fail
+    applied_stale = store.mark_sent(row_id=claim1.id, claim_token=stale_token)
+    assert applied_stale is False
+    refreshed = store.get_by_id(claim1.id)
+    assert refreshed.status == "claimed"  # NOT flipped to sent
+
+    # Fresh worker with fresh token → success
+    applied_fresh = store.mark_sent(row_id=claim2.id, claim_token=fresh_token)
+    assert applied_fresh is True
+    final = store.get_by_id(claim2.id)
+    assert final.status == "sent"
+
+
+def test_record_failure_rejects_stale_claim_token(tmp_path: Path):
+    """Round-2 HIGH-2: stale worker cannot record_failure row that was reclaimed."""
+    store, db_path = _make_store(tmp_path)
+    enq_time = datetime(2026, 5, 24, 12, 0, tzinfo=timezone.utc)
+    _enqueue(store, dedup_key="fence-fail", now=enq_time)
+
+    claim1 = store.claim_due(now=enq_time, limit=10)[0]
+    stale_token = claim1.claim_token
+
+    # Reclaim
+    recovery_time = enq_time + timedelta(minutes=10)
+    store.recover_zombies(now=recovery_time, timeout_seconds=300)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE outbox SET status='pending', next_retry_at=?, claim_token=NULL WHERE id=?",
+                     (recovery_time.isoformat(), claim1.id))
+    claim2 = store.claim_due(now=recovery_time, limit=10)[0]
+
+    applied_stale = store.record_failure(row_id=claim1.id, claim_token=stale_token, error="late")
+    assert applied_stale is False
+    refreshed = store.get_by_id(claim1.id)
+    assert refreshed.status == "claimed"  # untouched by stale call
