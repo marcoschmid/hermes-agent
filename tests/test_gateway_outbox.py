@@ -286,3 +286,57 @@ def test_outbox_db_schema_verify_columns_and_indexes(tmp_path: Path):
         assert "dedup_key" in indexed_columns
     finally:
         conn.close()
+
+
+# ---- Round-3: extensions for notification_worker (Track C) ------------------
+
+
+def test_outbox_get_by_id_returns_current_state(tmp_path: Path):
+    store, db_path = _make_store(tmp_path)
+    row_id = _result_id(_enqueue(store, dedup_key="get-by-id-test"), db_path, "get-by-id-test")
+
+    fetched = store.get_by_id(row_id)
+
+    assert fetched is not None
+    assert fetched.id == row_id
+    assert fetched.status == "pending"
+    assert fetched.dedup_key == "get-by-id-test"
+
+
+def test_outbox_get_by_id_missing_returns_none(tmp_path: Path):
+    store, _db_path = _make_store(tmp_path)
+
+    fetched = store.get_by_id("nonexistent-id")
+
+    assert fetched is None
+
+
+def test_outbox_recover_zombies_resets_old_claimed_rows(tmp_path: Path):
+    store, db_path = _make_store(tmp_path)
+    enq_time = datetime(2026, 5, 24, 12, 0, tzinfo=timezone.utc)
+    _enqueue(store, dedup_key="zombie-1", now=enq_time)
+
+    # Simulate claim_due (transitions to 'claimed' at enq_time)
+    claimed = store.claim_due(now=enq_time, limit=10)
+    assert len(claimed) == 1
+
+    # Simulate worker-crash: now+10min, zombie_timeout=5min → should recover
+    now_after_crash = enq_time + timedelta(minutes=10)
+    recovered = store.recover_zombies(now=now_after_crash, timeout_seconds=300)
+
+    assert recovered == 1
+    row = store.get_by_id(claimed[0].id)
+    assert row.status == "pending"
+
+
+def test_outbox_recover_zombies_skips_recent_claimed_rows(tmp_path: Path):
+    store, _db_path = _make_store(tmp_path)
+    enq_time = datetime(2026, 5, 24, 12, 0, tzinfo=timezone.utc)
+    _enqueue(store, dedup_key="fresh-claim", now=enq_time)
+    store.claim_due(now=enq_time, limit=10)
+
+    # 2min later: timeout is 5min, so don't recover yet
+    now_recent = enq_time + timedelta(minutes=2)
+    recovered = store.recover_zombies(now=now_recent, timeout_seconds=300)
+
+    assert recovered == 0
