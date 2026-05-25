@@ -7,6 +7,9 @@ dispatches via Router-cascade, and persists ``mark_sent`` / ``record_failure``.
 Crash-safe: rows stuck in ``claimed`` status > ``zombie_timeout_seconds``
 get re-claimed via ``recover_zombies()``.
 
+Heartbeat: writes timestamp to ``heartbeat_path`` after each cycle. External
+watchdog reads file-mtime to detect stuck/dead worker.
+
 Designed for LaunchAgent ``de.marcoschmid.hermes-notification-worker``.
 
 See ``projects/jarvis-os-redesign/plans/2026-05-24-p4-track-c-notification-worker.md``.
@@ -19,6 +22,7 @@ import signal
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from .fallback_channels import FallbackNotificationRouter, SendResult
@@ -29,6 +33,7 @@ log = logging.getLogger(__name__)
 ZOMBIE_CLAIM_TIMEOUT_SECONDS = 300
 POLL_INTERVAL_SECONDS = 10
 CLAIM_BATCH_SIZE = 25
+DEFAULT_HEARTBEAT_PATH = "~/.openclaw/run/notification-worker.heartbeat"
 
 
 @dataclass(slots=True)
@@ -51,6 +56,7 @@ class NotificationWorker:
         poll_interval: float = POLL_INTERVAL_SECONDS,
         claim_batch_size: int = CLAIM_BATCH_SIZE,
         zombie_timeout_seconds: int = ZOMBIE_CLAIM_TIMEOUT_SECONDS,
+        heartbeat_path: str | None = None,
     ) -> None:
         self._outbox = outbox
         self._router_factory = router_factory
@@ -58,6 +64,7 @@ class NotificationWorker:
         self._batch_size = claim_batch_size
         self._zombie_timeout = zombie_timeout_seconds
         self._shutdown_event = threading.Event()
+        self._heartbeat_path = Path(heartbeat_path).expanduser() if heartbeat_path else None
 
     def run_once(self, *, now: datetime | None = None) -> CycleStats:
         """Process one batch. Returns stats. Caller controls loop-cadence."""
@@ -78,7 +85,26 @@ class NotificationWorker:
                 break
             self._dispatch_row(row, now=now, stats=stats)
 
+        self._write_heartbeat(now=now, stats=stats)
         return stats
+
+    def _write_heartbeat(self, *, now: datetime, stats: CycleStats) -> None:
+        """Touch heartbeat file with cycle-stats JSON. Watchdog reads file-mtime."""
+        if self._heartbeat_path is None:
+            return
+        payload = {
+            "timestamp": now.isoformat(),
+            "claimed": stats.claimed,
+            "sent": stats.sent,
+            "failed": stats.failed,
+            "dead_lettered": stats.dead_lettered,
+            "zombie_recovered": stats.zombie_recovered,
+        }
+        try:
+            self._heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+            self._heartbeat_path.write_text(json.dumps(payload) + "\n")
+        except OSError as exc:
+            log.warning("heartbeat write failed (path=%s): %s", self._heartbeat_path, exc)
 
     def _dispatch_row(self, row: OutboxRow, *, now: datetime, stats: CycleStats) -> None:
         try:

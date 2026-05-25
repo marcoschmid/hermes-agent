@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  P4 Track C followup: notification_worker_watchdog LaunchAgent.
+
+  Install:
+    cp scripts/launchagents/de.marcoschmid.hermes-notification-worker-watchdog.plist \
+       ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) \
+       ~/Library/LaunchAgents/de.marcoschmid.hermes-notification-worker-watchdog.plist
+
+  Verify:
+    launchctl print gui/$(id -u)/de.marcoschmid.hermes-notification-worker-watchdog
+    tail -f ~/.openclaw/logs/notification-worker-watchdog.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>de.marcoschmid.hermes-notification-worker-watchdog</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/marco/Code/hermes-agent/scripts/notification-worker-watchdog.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/marco</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/marco/.openclaw/logs/notification-worker-watchdog.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/marco/.openclaw/logs/notification-worker-watchdog.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

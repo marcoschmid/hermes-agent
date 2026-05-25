@@ -309,6 +309,38 @@ def test_payload_to_router_args_handles_legacy_freeform_payload():
     assert issue["id"] == "row-2"
 
 
+def test_worker_writes_heartbeat_file_after_cycle(tmp_path: Path):
+    """Watchdog reads heartbeat-file mtime to detect stuck worker."""
+    store = _make_store(tmp_path)
+    heartbeat = tmp_path / "hb"
+    worker = NotificationWorker(
+        outbox=store,
+        router_factory=lambda _ch: _make_router(ok=True),
+        heartbeat_path=str(heartbeat),
+    )
+
+    worker.run_once(now=datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc))
+
+    assert heartbeat.exists()
+    payload = json.loads(heartbeat.read_text())
+    assert payload["timestamp"] == "2026-05-25T12:00:00+00:00"
+    assert payload["claimed"] == 0
+    assert "sent" in payload
+
+
+def test_worker_heartbeat_disabled_when_path_none(tmp_path: Path):
+    """No heartbeat_path → no file written (legacy callers backward-compat)."""
+    store = _make_store(tmp_path)
+    worker = NotificationWorker(
+        outbox=store,
+        router_factory=lambda _ch: _make_router(ok=True),
+        heartbeat_path=None,
+    )
+
+    worker.run_once(now=datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc))
+    # No heartbeat-file written, no exception
+
+
 def test_payload_to_router_args_forwards_target_and_context():
     """Round-2 HIGH-2: target/context from outbox payload must reach issue dict
     so direct-sender uses caller-supplied chat-id, not factory-default."""

@@ -68,6 +68,10 @@ def main() -> int:
     poll_interval = float(os.environ.get("HERMES_NOTIFICATION_WORKER_POLL_INTERVAL", "10"))
     batch_size = int(os.environ.get("HERMES_NOTIFICATION_WORKER_BATCH_SIZE", "25"))
     zombie_timeout = int(os.environ.get("HERMES_NOTIFICATION_WORKER_ZOMBIE_TIMEOUT", "300"))
+    heartbeat_path = os.environ.get(
+        "HERMES_NOTIFICATION_WORKER_HEARTBEAT",
+        "~/.openclaw/run/notification-worker.heartbeat",
+    )
 
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     outbox = OutboxStore(db_path=db_path)
@@ -79,6 +83,7 @@ def main() -> int:
         poll_interval=poll_interval,
         claim_batch_size=batch_size,
         zombie_timeout_seconds=zombie_timeout,
+        heartbeat_path=heartbeat_path,
     )
 
     log.info("notification_worker_entrypoint: db=%s poll=%.1fs", db_path, poll_interval)

@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  P4 Track C: notification_worker LaunchAgent template.
+
+  Install:
+    cp scripts/launchagents/de.marcoschmid.hermes-notification-worker.plist \
+       ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) \
+       ~/Library/LaunchAgents/de.marcoschmid.hermes-notification-worker.plist
+
+  Verify:
+    launchctl print gui/$(id -u)/de.marcoschmid.hermes-notification-worker
+    tail -f ~/.openclaw/logs/notification-worker.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>de.marcoschmid.hermes-notification-worker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/marco/Code/hermes-agent/scripts/notification-worker-runner.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/marco</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/marco/.openclaw/logs/notification-worker.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/marco/.openclaw/logs/notification-worker.error.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+</dict>
+</plist>
