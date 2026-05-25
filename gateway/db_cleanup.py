@@ -17,6 +17,17 @@ Safety:
 - Idempotent: running multiple times = same end-state.
 - read-only-dry-run mode for verification.
 - VACUUM is OPT-IN (SQLite-locks DB; out-of-scope for cron).
+- Per-run cap (max_batches_per_status) bounds catch-up after long outage;
+  remaining rows picked up next cycle.
+
+Dead-letter drain procedure (manual, when DEAD_LETTER_ALERT_THRESHOLD
+exceeded — logged WARN by cleanup):
+  1. Inspect: sqlite3 ~/.hermes/outbox.db "SELECT * FROM outbox WHERE status='dead-lettered'"
+  2. Decide per row: investigate root cause + manually retry OR archive.
+  3. Drain after review:
+       sqlite3 ~/.hermes/outbox.db "DELETE FROM outbox \\
+         WHERE status='dead-lettered' AND id IN ('<id1>', '<id2>', ...)"
+  Same procedure for telegram_callbacks (column dispatch_status).
 
 Designed for LaunchAgent ``de.marcoschmid.hermes-db-cleanup`` daily 04:00.
 """
@@ -45,7 +56,25 @@ TELEGRAM_CALLBACKS_RETENTION_DEFAULTS: dict[str, int | None] = {
     "ignored": 7,
 }
 
+# Round-2 HIGH-1: status-specific timestamp anchors. Terminal-state statuses
+# use processed_at (when delivery resolved) instead of received_at (when
+# callback arrived). A long backlog from dispatcher-outage would otherwise
+# instantly purge freshly-resolved rows.
+TELEGRAM_CALLBACKS_TIMESTAMP_PER_STATUS: dict[str, str] = {
+    "processed": "processed_at",
+    "failed": "processed_at",
+    "dead-lettered": "processed_at",
+    "ignored": "received_at",  # ignored rows never get processed_at
+}
+
 DELETE_BATCH_LIMIT = 5000
+# Round-2 MEDIUM-2: bound per-status catch-up work so a long-outage backlog
+# doesn't monopolize SQLite writers in one 04:00 cron. Remaining work picked
+# up next cycle.
+MAX_BATCHES_PER_STATUS = 10
+# Round-2 MEDIUM-3: alert when dead-letter retention exceeds threshold so
+# Marco notices accumulation before it grows unbounded.
+DEAD_LETTER_ALERT_THRESHOLD = 100
 
 
 @dataclass(slots=True)
@@ -53,6 +82,8 @@ class CleanupStats:
     table: str
     deleted: int = 0
     skipped_protected: int = 0
+    remaining_eligible: int = 0
+    dead_letter_alert: bool = False
 
 
 def _utcnow() -> datetime:
@@ -80,6 +111,7 @@ def cleanup_outbox(
     now: datetime | None = None,
     dry_run: bool = False,
     timestamp_column: str = "updated_at",
+    max_batches_per_status: int = MAX_BATCHES_PER_STATUS,
 ) -> CleanupStats:
     """Delete sent rows older than retention[status] days. Retain protected statuses.
 
@@ -89,6 +121,7 @@ def cleanup_outbox(
         now: timestamp anchor for cutoff calculation.
         dry_run: count rows that would delete, do not delete.
         timestamp_column: which column to age-against (default updated_at).
+        max_batches_per_status: cap catch-up work per run (Round-2 MEDIUM-2).
     """
     retention = retention or OUTBOX_RETENTION_DEFAULTS
     now = now or _utcnow()
@@ -99,6 +132,9 @@ def cleanup_outbox(
         return stats
 
     with closing(_connect(db_path)) as conn:
+        _ensure_cleanup_index(conn, "outbox", "outbox_cleanup_idx",
+                              f"status, {timestamp_column}")
+
         for status, days in retention.items():
             if days is None:
                 continue
@@ -111,8 +147,8 @@ def cleanup_outbox(
                 ).fetchone()
                 stats.deleted += int(count_row["n"] or 0)
                 continue
-            # Batched delete to avoid million-row stalls
-            while True:
+            # Batched delete with per-run cap
+            for _batch in range(max_batches_per_status):
                 cursor = conn.execute(
                     f"DELETE FROM outbox "
                     f"WHERE rowid IN ("
@@ -125,8 +161,16 @@ def cleanup_outbox(
                 stats.deleted += rc
                 if rc < DELETE_BATCH_LIMIT:
                     break
+            else:
+                # Hit max_batches without draining — count remaining eligible
+                rem = conn.execute(
+                    f"SELECT COUNT(*) AS n FROM outbox "
+                    f"WHERE status=? AND {timestamp_column}<?",
+                    (status, cutoff),
+                ).fetchone()
+                stats.remaining_eligible += int(rem["n"] or 0)
 
-        # Audit: count protected rows (informational)
+        # Audit: count protected rows + dead-letter-alert threshold
         for status, days in retention.items():
             if days is not None:
                 continue
@@ -134,7 +178,15 @@ def cleanup_outbox(
                 "SELECT COUNT(*) AS n FROM outbox WHERE status=?",
                 (status,),
             ).fetchone()
-            stats.skipped_protected += int(row["n"] or 0)
+            count = int(row["n"] or 0)
+            stats.skipped_protected += count
+            if status == "dead-lettered" and count >= DEAD_LETTER_ALERT_THRESHOLD:
+                stats.dead_letter_alert = True
+                log.warning(
+                    "outbox dead-lettered rows >= threshold (%d >= %d). "
+                    "Manual drain required. See module docstring for procedure.",
+                    count, DEAD_LETTER_ALERT_THRESHOLD,
+                )
 
     return stats
 
@@ -145,10 +197,20 @@ def cleanup_telegram_callbacks(
     retention: dict[str, int | None] | None = None,
     now: datetime | None = None,
     dry_run: bool = False,
-    timestamp_column: str = "received_at",
+    timestamp_per_status: dict[str, str] | None = None,
+    max_batches_per_status: int = MAX_BATCHES_PER_STATUS,
 ) -> CleanupStats:
-    """Delete telegram_callbacks rows by dispatch_status retention."""
+    """Delete telegram_callbacks rows by dispatch_status retention.
+
+    Round-2 HIGH-1: timestamp_per_status maps each status to the right
+    age-anchor. Terminal-state statuses (processed/failed/dead-lettered) use
+    processed_at so post-outage-resolved rows aren't insta-purged when
+    received_at is already past retention. ignored rows never get
+    processed_at, so received_at is used. COALESCE with received_at falls
+    back gracefully for legacy rows where processed_at is NULL.
+    """
     retention = retention or TELEGRAM_CALLBACKS_RETENTION_DEFAULTS
+    timestamp_per_status = timestamp_per_status or TELEGRAM_CALLBACKS_TIMESTAMP_PER_STATUS
     now = now or _utcnow()
     stats = CleanupStats(table="telegram_callbacks")
 
@@ -166,24 +228,32 @@ def cleanup_telegram_callbacks(
                         "dispatch_status; skipping")
             return stats
 
+        _ensure_cleanup_index(conn, "telegram_callbacks",
+                              "telegram_callbacks_cleanup_idx",
+                              "dispatch_status, processed_at")
+
         for status, days in retention.items():
             if days is None:
                 continue
             cutoff = _iso(now - timedelta(days=days))
+            ts_col = timestamp_per_status.get(status, "received_at")
+            # COALESCE(processed_at, received_at) lets legacy rows with NULL
+            # processed_at fall back gracefully without leaking.
+            age_expr = f"COALESCE({ts_col}, received_at)" if ts_col == "processed_at" else ts_col
             if dry_run:
                 count_row = conn.execute(
                     f"SELECT COUNT(*) AS n FROM telegram_callbacks "
-                    f"WHERE dispatch_status=? AND {timestamp_column}<?",
+                    f"WHERE dispatch_status=? AND {age_expr}<?",
                     (status, cutoff),
                 ).fetchone()
                 stats.deleted += int(count_row["n"] or 0)
                 continue
-            while True:
+            for _batch in range(max_batches_per_status):
                 cursor = conn.execute(
                     f"DELETE FROM telegram_callbacks "
                     f"WHERE rowid IN ("
                     f"  SELECT rowid FROM telegram_callbacks "
-                    f"  WHERE dispatch_status=? AND {timestamp_column}<? LIMIT ?"
+                    f"  WHERE dispatch_status=? AND {age_expr}<? LIMIT ?"
                     f")",
                     (status, cutoff, DELETE_BATCH_LIMIT),
                 )
@@ -191,6 +261,13 @@ def cleanup_telegram_callbacks(
                 stats.deleted += rc
                 if rc < DELETE_BATCH_LIMIT:
                     break
+            else:
+                rem = conn.execute(
+                    f"SELECT COUNT(*) AS n FROM telegram_callbacks "
+                    f"WHERE dispatch_status=? AND {age_expr}<?",
+                    (status, cutoff),
+                ).fetchone()
+                stats.remaining_eligible += int(rem["n"] or 0)
 
         for status, days in retention.items():
             if days is not None:
@@ -199,9 +276,30 @@ def cleanup_telegram_callbacks(
                 "SELECT COUNT(*) AS n FROM telegram_callbacks WHERE dispatch_status=?",
                 (status,),
             ).fetchone()
-            stats.skipped_protected += int(row["n"] or 0)
+            count = int(row["n"] or 0)
+            stats.skipped_protected += count
+            if status == "dead-lettered" and count >= DEAD_LETTER_ALERT_THRESHOLD:
+                stats.dead_letter_alert = True
+                log.warning(
+                    "telegram_callbacks dead-lettered rows >= threshold "
+                    "(%d >= %d). Manual drain required.",
+                    count, DEAD_LETTER_ALERT_THRESHOLD,
+                )
 
     return stats
+
+
+def _ensure_cleanup_index(conn: sqlite3.Connection, table: str,
+                          index_name: str, columns: str) -> None:
+    """Round-2 MEDIUM-2: cleanup-specific indexes to speed batched deletes."""
+    try:
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table}({columns})")
+    except sqlite3.OperationalError as exc:
+        # If column doesn't exist yet (mid-migration), skip silently
+        if "no such column" in str(exc).lower():
+            log.warning("cleanup index %s skipped: %s", index_name, exc)
+            return
+        raise
 
 
 def run_all(

@@ -273,3 +273,122 @@ def test_run_all_handles_missing_dbs_gracefully(tmp_path: Path):
     assert len(results) == 2
     for r in results:
         assert r.deleted == 0
+
+
+# ---- Round-2 fixes ---------------------------------------------------------
+
+
+def test_callbacks_retention_uses_processed_at_not_received_at(tmp_path: Path):
+    """Round-2 HIGH-1: processed rows aged from processed_at, not received_at.
+    Backlog-recovery scenario: received 60d ago, processed yesterday → KEEP."""
+    db = _make_callbacks_db(tmp_path)
+    # Directly insert with explicit processed_at controlling age
+    old_received = (NOW - timedelta(days=60)).isoformat()
+    recent_processed = (NOW - timedelta(days=1)).isoformat()
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT INTO telegram_callbacks "
+        "(callback_id, update_id, user_id, callback_type, callback_data, "
+        "received_at, processed_at, accepted, dispatch_status, attempts) "
+        "VALUES ('backlog-1', 1, '1', 'approve', 'approve:X', ?, ?, 1, 'processed', 1)",
+        (old_received, recent_processed),
+    )
+    conn.commit()
+    conn.close()
+
+    stats = cleanup_telegram_callbacks(str(db), now=NOW)
+
+    assert stats.deleted == 0
+    assert _count(db, "telegram_callbacks") == 1
+
+
+def test_callbacks_retention_legacy_null_processed_at_falls_back_to_received_at(tmp_path: Path):
+    """Round-2 HIGH-1: when processed_at NULL (legacy), fall back to received_at
+    so legacy rows still drain after retention."""
+    db = _make_callbacks_db(tmp_path)
+    old_received = (NOW - timedelta(days=60)).isoformat()
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT INTO telegram_callbacks "
+        "(callback_id, update_id, user_id, callback_type, callback_data, "
+        "received_at, processed_at, accepted, dispatch_status, attempts) "
+        "VALUES ('legacy-null-pa', 1, '1', 'approve', 'approve:X', ?, NULL, 1, 'processed', 1)",
+        (old_received,),
+    )
+    conn.commit()
+    conn.close()
+
+    stats = cleanup_telegram_callbacks(str(db), now=NOW)
+
+    assert stats.deleted == 1
+
+
+def test_cleanup_outbox_max_batches_caps_per_run(tmp_path: Path):
+    """Round-2 MEDIUM-2: per-run cap. With max_batches=1 + LIMIT=5000, only 5000 deleted."""
+    db = _make_outbox(tmp_path)
+    very_old = (NOW - timedelta(days=200)).isoformat()
+    # Insert 100 old-sent rows (way under LIMIT but tests max_batches semantic)
+    rows = [
+        {"id": f"old-{i}", "dedup": f"d-{i}", "status": "sent", "updated_at": very_old}
+        for i in range(100)
+    ]
+    _populate_outbox(db, rows)
+
+    # max_batches_per_status=0 → skip delete-loop entirely
+    stats = cleanup_outbox(str(db), now=NOW, max_batches_per_status=0)
+
+    assert stats.deleted == 0
+    assert stats.remaining_eligible == 100
+
+
+def test_cleanup_outbox_dead_letter_threshold_alert(tmp_path: Path):
+    """Round-2 MEDIUM-3: dead-letter count >= threshold flags alert."""
+    db = _make_outbox(tmp_path)
+    long_ago = (NOW - timedelta(days=365)).isoformat()
+    # Patch threshold via direct import
+    from gateway import db_cleanup as dc_module
+    original = dc_module.DEAD_LETTER_ALERT_THRESHOLD
+    dc_module.DEAD_LETTER_ALERT_THRESHOLD = 3
+    try:
+        rows = [
+            {"id": f"dl-{i}", "dedup": f"dlk-{i}",
+             "status": "dead-lettered", "updated_at": long_ago}
+            for i in range(5)
+        ]
+        _populate_outbox(db, rows)
+
+        stats = cleanup_outbox(str(db), now=NOW)
+    finally:
+        dc_module.DEAD_LETTER_ALERT_THRESHOLD = original
+
+    assert stats.dead_letter_alert is True
+    assert stats.skipped_protected == 5
+
+
+def test_cleanup_outbox_dead_letter_under_threshold_no_alert(tmp_path: Path):
+    db = _make_outbox(tmp_path)
+    long_ago = (NOW - timedelta(days=365)).isoformat()
+    _populate_outbox(db, [
+        {"id": "dl-1", "dedup": "d1", "status": "dead-lettered", "updated_at": long_ago},
+    ])
+
+    stats = cleanup_outbox(str(db), now=NOW)
+
+    assert stats.dead_letter_alert is False
+    assert stats.skipped_protected == 1
+
+
+def test_cleanup_creates_cleanup_indexes_idempotent(tmp_path: Path):
+    """Round-2 MEDIUM-2: cleanup indexes created on first run, no-op on second."""
+    db = _make_outbox(tmp_path)
+    cleanup_outbox(str(db), now=NOW)
+
+    conn = sqlite3.connect(str(db))
+    indexes = {row[1] for row in conn.execute(
+        "SELECT * FROM sqlite_master WHERE type='index'"
+    ).fetchall()}
+    conn.close()
+    assert "outbox_cleanup_idx" in indexes
+
+    # Second run must not raise
+    cleanup_outbox(str(db), now=NOW)
