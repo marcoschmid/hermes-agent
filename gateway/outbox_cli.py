@@ -115,8 +115,25 @@ def _build_payload(args: argparse.Namespace) -> dict[str, Any]:
             buttons = json.loads(args.buttons)
         except json.JSONDecodeError as exc:
             raise ValueError(f"--buttons must be valid JSON: {exc}") from None
+        # Codex Review feedback (PR #20 follow-up): Telegram inline_keyboard
+        # expects array-of-rows, NOT flat button-list. Flat input would silently
+        # drop buttons at render time (Hub/MC refuse → direct → safe_telegram_send
+        # passes JSON through, Telegram-API rejects/ignores). Validate structure.
         if not isinstance(buttons, list):
-            raise ValueError("--buttons must be a JSON array (Telegram inline-keyboard convention)")
+            raise ValueError("--buttons must be a JSON array of rows "
+                             "(Telegram inline-keyboard: [[btn,btn],[btn]])")
+        for row_idx, row in enumerate(buttons):
+            if not isinstance(row, list):
+                raise ValueError(
+                    f"--buttons row {row_idx} must be a JSON array of button-objects "
+                    f"(got {type(row).__name__}); use [[btn]] for single button"
+                )
+            for btn_idx, btn in enumerate(row):
+                if not isinstance(btn, dict):
+                    raise ValueError(
+                        f"--buttons row {row_idx} button {btn_idx} must be a JSON object "
+                        f"with 'text' field (got {type(btn).__name__})"
+                    )
         payload["buttons"] = buttons
     return payload
 

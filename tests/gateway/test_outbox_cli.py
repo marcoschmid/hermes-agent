@@ -362,6 +362,58 @@ def test_cli_buttons_non_array_returns_exit_2(tmp_path: Path):
     assert "array" in err.lower() or "buttons" in err.lower()
 
 
+def test_cli_buttons_flat_row_rejected(tmp_path: Path):
+    """Codex Review PR #20 follow-up: Telegram inline_keyboard expects
+    array-of-rows. Flat button-list like [{"text":"Ack"}] (NOT wrapped in row)
+    would silently drop buttons at render-time. Reject early."""
+    db = tmp_path / "outbox.db"
+    rc, _out, err = _capture([
+        "--channel", "telegram",
+        "--dedup-key", "buttons-flat",
+        "--message", "test",
+        "--buttons", '[{"text":"Ack","callback_data":"ack"}]',  # flat, not nested
+        "--db-path", str(db),
+    ])
+
+    assert rc == 2
+    assert "row" in err.lower() and "array" in err.lower()
+
+
+def test_cli_buttons_non_dict_button_rejected(tmp_path: Path):
+    """Codex Review follow-up: each button must be a JSON object with 'text'.
+    String/int as button entry must be rejected."""
+    db = tmp_path / "outbox.db"
+    rc, _out, err = _capture([
+        "--channel", "telegram",
+        "--dedup-key", "buttons-non-dict",
+        "--message", "test",
+        "--buttons", '[["Ack"]]',  # string instead of {"text":"Ack"}
+        "--db-path", str(db),
+    ])
+
+    assert rc == 2
+    assert "object" in err.lower() or "button" in err.lower()
+
+
+def test_cli_buttons_nested_rows_accepted(tmp_path: Path):
+    """Single-button-per-row + multi-button-row both valid Telegram inline-
+    keyboard layouts."""
+    db = tmp_path / "outbox.db"
+    nested = '[[{"text":"A","callback_data":"a"},{"text":"B","callback_data":"b"}],[{"text":"C","callback_data":"c"}]]'
+    rc, _out, err = _capture([
+        "--channel", "telegram",
+        "--dedup-key", "buttons-nested-ok",
+        "--message", "test",
+        "--buttons", nested,
+        "--db-path", str(db),
+    ])
+
+    assert rc == 0, err
+    row = _db_row(db, "buttons-nested-ok")
+    payload = json.loads(row["payload_json"])
+    assert payload["buttons"] == json.loads(nested)
+
+
 def test_cli_dedupe_collision_reports_deduped_true(tmp_path: Path):
     """Round-2 MEDIUM-4: second enqueue with same dedup_key must report deduped=true."""
     db = tmp_path / "outbox.db"
