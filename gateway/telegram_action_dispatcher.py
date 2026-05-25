@@ -1,20 +1,19 @@
-"""Consumer-loop for telegram_callbacks (P4 Track B followup).
+"""Consumer-loop for telegram_callbacks dispatch (P4 Track B).
 
-Polls ``telegram_callbacks`` table for accepted-but-unprocessed rows + invokes
-the registered action-handler per callback_type, then persists ``processed_at``
-to mark done.
+Polls ``telegram_callbacks`` for dispatch_status='pending' AND next_retry_at <= now
+rows + invokes registered action-handler per callback_type + transitions row
+through claim/process/fail/dead-letter states.
 
-Designed for Hub-async-task (startup-event) OR separate LaunchAgent.
+Round-2 hardening (Codex no-ship findings):
+- HIGH-5 atomic claim with UUID claim_token. Two dispatcher instances cannot
+  double-dispatch the same row (UPDATE ... RETURNING fences ownership).
+- HIGH-2 transient-failure retry: handler exception increments attempts +
+  schedules backoff via next_retry_at. Dead-letter at DEAD_LETTER_THRESHOLD
+  attempts. Permanent-failure-class (unhandled type) → dispatch_status='failed'
+  immediately (no retry).
 
-Action-Handlers are dependency-injected by the host so this module stays
-test-isolated. Production wiring (Marco-side):
-- approve → paperclip_issue_client.update_issue(status='approved')
-- reject  → paperclip_issue_client.update_issue(status='rejected')
-- skip    → log-only (no Paperclip-side action)
-
-Crash-safe: rows with processed_at IS NULL get retried on next cycle.
-Idempotency-of-action is the handler's responsibility (Paperclip status-update
-is idempotent: approving an already-approved Issue is a no-op).
+Designed for separate LaunchAgent OR Hub-async-task. ActionHandler is
+dependency-injected by host (see notification_worker_entrypoint for pattern).
 
 See ``projects/jarvis-os-redesign/plans/2026-05-24-p4-track-b-telegram-receiver-wiring.md``.
 """
@@ -24,32 +23,56 @@ import logging
 import signal
 import sqlite3
 import threading
+import time
+import uuid
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Callable
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 5
 CLAIM_BATCH_SIZE = 25
+DEAD_LETTER_THRESHOLD = 5
+BACKOFF_BASE_SECONDS = 30
+BACKOFF_MAX_SECONDS = 3600
+BUSY_TIMEOUT_MS = 30000
+LOCK_RETRY_MAX = 5
+LOCK_RETRY_BASE_SLEEP = 0.1
 
-ActionHandler = Callable[[str, dict], None]
-"""Signature: handler(issue_id, row_dict) -> None. Raises on action-failure."""
+
+ActionHandler = Callable[[str, dict[str, Any]], None]
+"""Signature: handler(issue_id, row_dict) -> None. Raises on transient failure."""
 
 
 @dataclass(slots=True)
 class CycleStats:
-    fetched: int = 0
+    claimed: int = 0
     dispatched: int = 0
     failed: int = 0
+    dead_lettered: int = 0
+
+
+def _retry_on_locked(fn):
+    def wrapper(*args, **kwargs):
+        for attempt in range(LOCK_RETRY_MAX):
+            try:
+                return fn(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == LOCK_RETRY_MAX - 1:
+                    raise
+                time.sleep(LOCK_RETRY_BASE_SLEEP * (2 ** attempt))
+        raise RuntimeError("unreachable")
+    return wrapper
 
 
 class TelegramActionDispatcher:
-    """Consumer-loop for telegram_callbacks unprocessed rows.
+    """Atomic-claim consumer-loop for telegram_callbacks dispatch.
 
-    handlers maps callback_type -> ActionHandler. Unknown callback_types are
-    marked processed-with-error (no infinite retry on bad action_data).
+    handlers maps callback_type -> ActionHandler. Unknown callback_types
+    transition row to dispatch_status='failed' permanently (no retry, since
+    callback_data shape will not change).
     """
 
     def __init__(
@@ -59,43 +82,59 @@ class TelegramActionDispatcher:
         handlers: dict[str, ActionHandler],
         poll_interval: float = POLL_INTERVAL_SECONDS,
         batch_size: int = CLAIM_BATCH_SIZE,
+        dead_letter_threshold: int = DEAD_LETTER_THRESHOLD,
     ) -> None:
         self._db_path = str(db_path)
         self._handlers = handlers
         self._poll_interval = poll_interval
         self._batch_size = batch_size
+        self._dead_letter_threshold = dead_letter_threshold
         self._shutdown_event = threading.Event()
 
-    def run_once(self) -> CycleStats:
-        """Process one batch of unprocessed accepted-callbacks."""
+    def run_once(self, *, now: datetime | None = None) -> CycleStats:
+        """Process one batch atomically (claim → dispatch → mark)."""
+        now = now or _utcnow()
         stats = CycleStats()
-        rows = self._fetch_unprocessed()
-        stats.fetched = len(rows)
+        rows = self._claim_due(now=now)
+        stats.claimed = len(rows)
         for row in rows:
             if self._shutdown_event.is_set():
-                log.info("shutdown mid-batch; remaining %d rows retried next cycle",
-                         stats.fetched - stats.dispatched - stats.failed)
+                log.info("shutdown mid-batch; %d rows remain claimed (zombie-eligible)",
+                         stats.claimed - stats.dispatched - stats.failed - stats.dead_lettered)
                 break
-            self._dispatch_row(row, stats=stats)
+            self._dispatch_row(row, now=now, stats=stats)
         return stats
 
-    def _fetch_unprocessed(self) -> list[dict]:
+    @_retry_on_locked
+    def _claim_due(self, *, now: datetime) -> list[dict]:
+        """Atomic claim: UPDATE pending rows due now to status='claimed' with fresh token."""
+        ts = _iso(now)
+        token = uuid.uuid4().hex
         with closing(self._conn()) as conn:
             cursor = conn.execute(
-                "SELECT * FROM telegram_callbacks "
-                "WHERE processed_at IS NULL AND accepted=1 "
-                "ORDER BY received_at ASC LIMIT ?",
-                (self._batch_size,),
+                "UPDATE telegram_callbacks "
+                "SET dispatch_status='claimed', claim_token=? "
+                "WHERE callback_id IN ("
+                "  SELECT callback_id FROM telegram_callbacks "
+                "  WHERE dispatch_status='pending' AND accepted=1 "
+                "    AND (next_retry_at IS NULL OR next_retry_at<=?) "
+                "  ORDER BY received_at ASC LIMIT ?"
+                ") RETURNING *",
+                (token, ts, self._batch_size),
             )
             return [dict(r) for r in cursor.fetchall()]
 
-    def _dispatch_row(self, row: dict, *, stats: CycleStats) -> None:
+    def _dispatch_row(self, row: dict, *, now: datetime, stats: CycleStats) -> None:
+        callback_id = row["callback_id"]
+        claim_token = row["claim_token"]
         callback_type = row.get("callback_type") or ""
         handler = self._handlers.get(callback_type)
+
         if handler is None:
-            log.warning("no handler for callback_type=%r row=%s",
-                        callback_type, row.get("callback_id"))
-            self._mark_processed(row["callback_id"], error="no handler registered")
+            log.warning("no handler for callback_type=%r row=%s — permanent-fail",
+                        callback_type, callback_id)
+            self._mark_permanent_failure(callback_id, claim_token,
+                                         error="no handler registered", now=now)
             stats.failed += 1
             return
 
@@ -103,35 +142,84 @@ class TelegramActionDispatcher:
         try:
             handler(issue_id, row)
         except Exception as exc:
-            log.exception("action handler raised for callback=%s", row.get("callback_id"))
-            self._mark_processed(row["callback_id"], error=str(exc)[:400])
-            stats.failed += 1
+            log.warning("handler raised for callback=%s: %s — schedule retry",
+                        callback_id, exc)
+            outcome = self._record_transient_failure(
+                callback_id, claim_token, error=str(exc)[:400], now=now,
+            )
+            if outcome == "dead-lettered":
+                stats.dead_lettered += 1
+            else:
+                stats.failed += 1
             return
 
-        self._mark_processed(row["callback_id"], error=None)
+        self._mark_processed(callback_id, claim_token, now=now)
         stats.dispatched += 1
 
-    def _mark_processed(self, callback_id: str, *, error: str | None) -> None:
-        ts = _utcnow().isoformat()
+    @_retry_on_locked
+    def _mark_processed(self, callback_id: str, claim_token: str, *, now: datetime) -> None:
+        ts = _iso(now)
         with closing(self._conn()) as conn:
-            if error is None:
+            cursor = conn.execute(
+                "UPDATE telegram_callbacks SET dispatch_status='processed', "
+                "processed_at=?, claim_token=NULL "
+                "WHERE callback_id=? AND claim_token=?",
+                (ts, callback_id, claim_token),
+            )
+            if cursor.rowcount == 0:
+                log.warning("mark_processed stale claim row=%s", callback_id)
+
+    @_retry_on_locked
+    def _mark_permanent_failure(self, callback_id: str, claim_token: str,
+                                 *, error: str, now: datetime) -> None:
+        ts = _iso(now)
+        with closing(self._conn()) as conn:
+            conn.execute(
+                "UPDATE telegram_callbacks SET dispatch_status='failed', "
+                "last_error=?, processed_at=?, claim_token=NULL "
+                "WHERE callback_id=? AND claim_token=?",
+                (error, ts, callback_id, claim_token),
+            )
+
+    @_retry_on_locked
+    def _record_transient_failure(self, callback_id: str, claim_token: str,
+                                   *, error: str, now: datetime) -> str:
+        """Increment attempts + schedule backoff OR dead-letter. Returns outcome."""
+        ts = _iso(now)
+        with closing(self._conn()) as conn:
+            row = conn.execute(
+                "SELECT attempts FROM telegram_callbacks "
+                "WHERE callback_id=? AND claim_token=?",
+                (callback_id, claim_token),
+            ).fetchone()
+            if row is None:
+                log.warning("record_transient_failure stale claim row=%s", callback_id)
+                return "stale"
+            attempts = (row["attempts"] or 0) + 1
+            if attempts >= self._dead_letter_threshold:
                 conn.execute(
-                    "UPDATE telegram_callbacks SET processed_at=? "
-                    "WHERE callback_id=? AND processed_at IS NULL",
-                    (ts, callback_id),
+                    "UPDATE telegram_callbacks SET dispatch_status='dead-lettered', "
+                    "attempts=?, last_error=?, processed_at=?, claim_token=NULL "
+                    "WHERE callback_id=? AND claim_token=?",
+                    (attempts, error, ts, callback_id, claim_token),
                 )
-            else:
-                conn.execute(
-                    "UPDATE telegram_callbacks SET processed_at=?, error=? "
-                    "WHERE callback_id=? AND processed_at IS NULL",
-                    (ts, error, callback_id),
-                )
+                return "dead-lettered"
+            backoff = min(BACKOFF_MAX_SECONDS,
+                          BACKOFF_BASE_SECONDS * (2 ** (attempts - 1)))
+            next_retry = _iso(now + timedelta(seconds=backoff))
+            conn.execute(
+                "UPDATE telegram_callbacks SET dispatch_status='pending', "
+                "attempts=?, last_error=?, next_retry_at=?, claim_token=NULL "
+                "WHERE callback_id=? AND claim_token=?",
+                (attempts, error, next_retry, callback_id, claim_token),
+            )
+            return "retry"
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, isolation_level=None, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         return conn
 
     def run_forever(self) -> None:
@@ -141,9 +229,10 @@ class TelegramActionDispatcher:
         while not self._shutdown_event.is_set():
             try:
                 stats = self.run_once()
-                if stats.fetched:
-                    log.info("cycle: fetched=%d dispatched=%d failed=%d",
-                             stats.fetched, stats.dispatched, stats.failed)
+                if stats.claimed:
+                    log.info("cycle: claimed=%d dispatched=%d failed=%d dead=%d",
+                             stats.claimed, stats.dispatched, stats.failed,
+                             stats.dead_lettered)
             except Exception:
                 log.exception("dispatcher cycle raised; sleeping then retry")
             self._shutdown_event.wait(self._poll_interval)
@@ -165,3 +254,9 @@ class TelegramActionDispatcher:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()

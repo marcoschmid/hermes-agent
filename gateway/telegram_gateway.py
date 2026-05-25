@@ -76,7 +76,33 @@ class TelegramCallbackReceiver:
     def init_schema(self) -> None:
         with closing(self._conn()) as conn:
             conn.executescript(_SCHEMA_SQL)
+            self._ensure_dispatch_columns(conn)
             conn.commit()
+
+    @staticmethod
+    def _ensure_dispatch_columns(conn: sqlite3.Connection) -> None:
+        """Idempotent migration: add dispatcher-state columns to legacy tables.
+
+        Round-2 (Track B HIGH-5 fence + HIGH-2 retry): claim_token enables
+        ownership-fencing for action-dispatcher; attempts/last_error/
+        dispatch_status/next_retry_at enable transient-failure retry.
+        Concurrent-init tolerated via duplicate-column catch.
+        """
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(telegram_callbacks)").fetchall()}
+        for col_name, ddl in [
+            ("claim_token", "TEXT"),
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_error", "TEXT"),
+            ("dispatch_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("next_retry_at", "TEXT"),
+        ]:
+            if col_name in cols:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE telegram_callbacks ADD COLUMN {col_name} {ddl}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -165,16 +191,21 @@ class TelegramCallbackReceiver:
             ts = _iso(now)
             accepted_flag = 1 if is_known else 0
             error_msg = None if is_known else "unknown_callback_type"
+            # Round-2: rows with accepted=1 become dispatcher-pending; unknown
+            # (accepted=0) get dispatch_status='ignored' so dispatcher skips them.
+            initial_dispatch = "pending" if is_known else "ignored"
             try:
                 conn.execute(
                     "INSERT INTO telegram_callbacks "
                     "(callback_id, update_id, user_id, chat_id, message_id, "
                     "callback_type, callback_data, issue_id, received_at, "
-                    "processed_at, accepted, error) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?)",
+                    "processed_at, accepted, error, "
+                    "claim_token, attempts, last_error, dispatch_status, next_retry_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?,NULL,0,NULL,?,?)",
                     (callback_id, update_id, user_id, chat_id, message_id,
                      callback_type, callback_data, issue_id, ts,
-                     accepted_flag, error_msg),
+                     accepted_flag, error_msg,
+                     initial_dispatch, ts),
                 )
             except sqlite3.IntegrityError:
                 row = conn.execute(
