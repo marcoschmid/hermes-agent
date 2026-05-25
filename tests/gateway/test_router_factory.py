@@ -476,27 +476,43 @@ def test_direct_sender_omits_buttons_when_not_in_issue(tmp_path):
     assert "--buttons" not in cmd
 
 
-def test_hub_sender_refuses_buttons_payload():
-    """P4 Track A2 Wave-1: Hub-side does not yet support inline-keyboards.
-    To prevent silent buttons-drop, hub_sender returns ok=False when issue
-    carries buttons, forcing cascade fallback to direct-sender (which uses
-    safe_telegram_send.sh with --buttons)."""
+def test_hub_sender_forwards_buttons_in_intent_payload():
+    """P4 Track A2 Hub-Side: hub_sender now FORWARDS buttons via
+    NotificationIntent.payload field (Hub TelegramAdapter extracts them
+    -> reply_markup). Removes the refuse-early hack from PR #20."""
+    captured = {}
+
+    def fake_post(url, *, data=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["body"] = json.loads(data.decode("utf-8") if isinstance(data, bytes) else data)
+        # Return a 200 with event_id so _parse_intent_response treats as ok
+        class _Resp:
+            status_code = 200
+            text = ""
+            def json(self):
+                return {"data": {"event_id": "evt-1", "status": "delivered"}}
+        return _Resp()
+
     sender = make_hub_sender(
         hub_url="http://127.0.0.1:8766",
         bearer_token="hub-tok",
         source_slug="task-monitor",
     )
+    buttons = [[{"text": "Ack", "callback_data": "ack"}]]
+    with patch("gateway.router_factory.requests.post", side_effect=fake_post):
+        result = sender("stalled", issue={"id": "t-1", "buttons": buttons})
 
-    # No HTTP call expected — refused before network
-    result = sender("stalled", issue={"id": "t-1", "buttons": [[{"text": "OK"}]]})
-
-    assert result["ok"] is False
-    assert "buttons" in result["error"].lower()
+    assert result["ok"] is True
+    # Buttons forwarded to Hub via NotificationIntent.payload field
+    assert captured["body"].get("payload") == {"buttons": buttons}
 
 
 def test_mc_sender_refuses_buttons_payload():
-    """P4 Track A2 Wave-1: MC audit-only sink also does not push buttons.
-    Refuse forces cascade fallback to direct-sender."""
+    """P4 Track A2 Wave-1: MC audit-only sink does not push buttons.
+    MC refuse stays as cascade-safety: if Hub-path fails AND buttons present,
+    cascade must skip MC (which would mark ok=True without actual delivery)
+    and reach direct-sender. Removing this would silent-drop buttons on
+    hermes-failure cases."""
     sender = make_mc_sender(
         mc_url="http://127.0.0.1:3334",
         bearer_token="mc-tok",

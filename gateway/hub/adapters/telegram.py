@@ -17,6 +17,22 @@ def escape_markdown_v2(text: str) -> str:
     return "".join(f"\\{char}" if char in _MARKDOWN_V2_SPECIALS else char for char in text)
 
 
+def _build_reply_markup(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract Telegram inline_keyboard from event.payload.buttons.
+
+    Returns None when buttons are absent or empty (Telegram rejects empty
+    reply_markup). Expects nested array-of-rows shape per outbox_cli
+    validation (PR #21): payload.buttons = [[btn,btn],[btn]].
+    """
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    buttons = payload.get("buttons")
+    if not buttons:
+        return None
+    return {"inline_keyboard": buttons}
+
+
 class TelegramAdapter:
     name = "telegram"
 
@@ -46,6 +62,12 @@ class TelegramAdapter:
             "text": text,
             "parse_mode": "MarkdownV2",
         }
+        # P4 Track A2 Hub-Side: forward event.payload.buttons as inline_keyboard.
+        # Removes the hub-sender refuse-early hack from PR #20 by enabling
+        # Hub-path delivery of action-buttons (task_monitor_watchdog et al).
+        reply_markup = _build_reply_markup(event)
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         started = time.perf_counter()
 
         try:
@@ -93,6 +115,9 @@ class TelegramAdapter:
             "text": text,
             "parse_mode": "MarkdownV2",
         }
+        reply_markup = _build_reply_markup(event)
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         started = time.perf_counter()
 
         try:

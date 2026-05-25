@@ -148,16 +148,9 @@ def make_hub_sender(
     endpoint = hub_url.rstrip("/") + "/v1/notifications"
 
     def sender(message: str, issue: dict[str, Any] | None = None, **_: Any) -> dict[str, Any]:
-        # P4 Track A2 Wave-1: Hub-side inline-keyboard rendering not yet
-        # implemented in NotificationIntent schema. Refuse early when buttons
-        # present so cascade falls through to direct-sender (which uses
-        # safe_telegram_send.sh --buttons and DOES render). Without this
-        # refuse, Hub silently delivers message text without buttons, and
-        # cascade stops at hub.ok=True — user gets degraded UX without
-        # action-buttons. Remove once Hub TelegramAdapter handles
-        # payload['buttons'] -> reply_markup natively.
-        if issue and issue.get("buttons"):
-            return {"ok": False, "error": "hub: buttons not yet supported (forcing fallback)"}
+        # P4 Track A2 Hub-Side: buttons supported via NotificationIntent.payload
+        # field (Hub TelegramAdapter extracts payload.buttons -> reply_markup).
+        # No more refuse-early hack (was PR #20, removed by hub-buttons-PR).
         if auth_mode == "bearer":
             token = _resolve_token(direct_value=bearer_token, env_var=bearer_token_env)
             if not token:
@@ -182,6 +175,11 @@ def make_hub_sender(
             "body": _truncate_body(message),
             "dedupe_key": _dedupe_key_from(message, issue),
         }
+        # P4 Track A2 Hub-Side: forward buttons via NotificationIntent.payload
+        # for Hub TelegramAdapter to render as inline_keyboard.
+        buttons = issue.get("buttons")
+        if buttons:
+            payload["payload"] = {"buttons": buttons}
         body_bytes = json.dumps(payload).encode("utf-8")
 
         if auth_mode == "bearer":

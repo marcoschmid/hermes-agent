@@ -240,3 +240,95 @@ async def test_send_v4a_still_returns_plain_body(monkeypatch) -> None:
     assert "Impact" not in sent_text
     assert "Action" not in sent_text
     await adapter.close()
+
+
+# ---- P4 Track A2: Inline-Keyboard (Buttons) Hub-Side Support ---------------
+
+
+@pytest.mark.asyncio
+async def test_send_with_buttons_sets_reply_markup(monkeypatch) -> None:
+    """P4 Track A2 Hub-Side: event.payload.buttons must be sent as Telegram
+    reply_markup={inline_keyboard: ...}, enabling Hub-path delivery of buttons
+    (removes hub-sender refuse-early hack from PR #20)."""
+    monkeypatch.setenv("TELEGRAM_HERMES_BOT_TOKEN", "test-token")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 99}})
+
+    adapter = make_adapter(handler)
+    buttons = [
+        [{"text": "Show", "callback_data": "task_monitor_stalled"},
+         {"text": "Retry", "callback_data": "task_monitor_retry"}],
+        [{"text": "Ack", "callback_data": "task_monitor_ack"}],
+    ]
+    event = {
+        "title": "Stalled",
+        "body": "2 stalled tasks",
+        "payload": {"buttons": buttons},
+    }
+    await adapter.send(event=event, channel={"target_ref": "128314698"})
+
+    sent = captured["body"]
+    assert "reply_markup" in sent, "buttons must produce reply_markup field"
+    assert sent["reply_markup"] == {"inline_keyboard": buttons}
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_send_without_buttons_omits_reply_markup(monkeypatch) -> None:
+    """Backward-compat: events without payload.buttons must not include
+    reply_markup (Telegram API rejects empty reply_markup)."""
+    monkeypatch.setenv("TELEGRAM_HERMES_BOT_TOKEN", "test-token")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 10}})
+
+    adapter = make_adapter(handler)
+    event = {"title": "X", "body": "no buttons here"}
+    await adapter.send(event=event, channel={"target_ref": "12345"})
+
+    assert "reply_markup" not in captured["body"]
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_send_with_empty_buttons_list_omits_reply_markup(monkeypatch) -> None:
+    """Edge case: payload.buttons=[] is empty, must not produce reply_markup."""
+    monkeypatch.setenv("TELEGRAM_HERMES_BOT_TOKEN", "test-token")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 11}})
+
+    adapter = make_adapter(handler)
+    event = {"title": "X", "body": "empty buttons", "payload": {"buttons": []}}
+    await adapter.send(event=event, channel={"target_ref": "12345"})
+
+    assert "reply_markup" not in captured["body"]
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_edit_with_buttons_sets_reply_markup(monkeypatch) -> None:
+    """editMessageText must also forward buttons as reply_markup."""
+    monkeypatch.setenv("TELEGRAM_HERMES_BOT_TOKEN", "test-token")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 42}})
+
+    adapter = make_adapter(handler)
+    buttons = [[{"text": "Ack", "callback_data": "ack"}]]
+    event = {"title": "X", "body": "edit with buttons", "payload": {"buttons": buttons}}
+    await adapter.edit(event=event, channel={"target_ref": "12345"}, message_id="42")
+
+    assert "/editMessageText" in captured["path"]
+    assert captured["body"]["reply_markup"] == {"inline_keyboard": buttons}
+    await adapter.close()
