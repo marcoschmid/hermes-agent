@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  P4 Track B: telegram_action_dispatcher LaunchAgent.
+
+  PREREQUISITES (Marco-Manual):
+  1. Hub-mount with webhook-secret installed + setWebhook configured
+     (see telegram_webhook_route.py module docstring for cutover-gate).
+  2. paperclip_issue_action handler-stub at gateway/telegram_action_dispatcher_entrypoint.py
+     wires real Paperclip-API when client-lib ready.
+
+  Install:
+    cp scripts/launchagents/de.marcoschmid.hermes-telegram-action-dispatcher.plist \
+       ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) \
+       ~/Library/LaunchAgents/de.marcoschmid.hermes-telegram-action-dispatcher.plist
+
+  Verify:
+    launchctl print gui/$(id -u)/de.marcoschmid.hermes-telegram-action-dispatcher
+    tail -f ~/.openclaw/logs/telegram-action-dispatcher.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>de.marcoschmid.hermes-telegram-action-dispatcher</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/marco/Code/hermes-agent/scripts/telegram-action-dispatcher-runner.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/marco</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/marco/.openclaw/logs/telegram-action-dispatcher.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/marco/.openclaw/logs/telegram-action-dispatcher.error.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+</dict>
+</plist>

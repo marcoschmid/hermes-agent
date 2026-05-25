@@ -7,20 +7,38 @@ Wraps gateway.telegram_gateway.TelegramCallbackReceiver (PR #7 merged) which:
 - enforces per-user rate-limit
 - returns CallbackResult dataclass
 
-The route adapts CallbackResult -> JSON for Telegram's <500ms response window.
-Action-dispatch (Paperclip-Issue updates) happens async via
-gateway.telegram_action_dispatcher consumer-loop.
+The route runs sync receiver.handle_webhook via asyncio.to_thread so the
+event loop is never blocked by SQLite I/O (Round-2 HIGH-3 fix). Action-dispatch
+(Paperclip-Issue updates) happens async via gateway.telegram_action_dispatcher
+consumer-loop.
+
+CRITICAL DEPLOYMENT-GATE (Round-2 HIGH-4):
+==========================================
+Telegram delivers updates to ONE webhook URL per bot. Mission-Control's
+live /api/telegram/webhook handles media:*/dec:*/voice/text. If Marco runs
+`setWebhook` pointing at Hub, MC stops receiving those updates — voice
+commands, image-gen approve buttons, decision-board dec:* all break.
+
+DO NOT switch the bot webhook URL until either:
+  (a) MC remains the front-door and relays approve/reject/skip to Hub, OR
+  (b) Hub implements multiplexer for media:*/dec:*/voice/text.
+
+See plan §"Architecture-Decision" + §"Risiken / MC-Webhook-Konflikt".
 
 Config via env (read at receiver-build time):
 - TELEGRAM_CALLBACKS_DB: SQLite path (default ~/.hermes/telegram_callbacks.db)
-- TELEGRAM_WEBHOOK_SECRET: required, set via setWebhook secret_token
+- TELEGRAM_WEBHOOK_SECRET: required (production-fatal if missing — see below)
 - TELEGRAM_ALLOWED_USER_IDS: comma-separated (default 128314698)
 - TELEGRAM_RATE_LIMIT_PER_MINUTE: default 60
+- HERMES_TELEGRAM_WEBHOOK_REQUIRED: if set to "1", startup FAILS when
+  TELEGRAM_WEBHOOK_SECRET is missing (production mode). Default unset =
+  dev/test mode where missing secret silently skips mount.
 
 See ``projects/jarvis-os-redesign/plans/2026-05-24-p4-track-b-telegram-receiver-wiring.md``.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -86,7 +104,11 @@ async def telegram_webhook(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="invalid_json")
 
     headers = dict(request.headers)
-    result: CallbackResult = receiver.handle_webhook(headers=headers, payload=payload)
+    # Round-2 HIGH-3: run sync sqlite-write off event-loop so DB lock-contention
+    # doesn't block other Hub requests + stay within Telegram's <500ms budget.
+    result: CallbackResult = await asyncio.to_thread(
+        receiver.handle_webhook, headers=headers, payload=payload,
+    )
 
     if result.status_code >= 400:
         raise HTTPException(status_code=result.status_code, detail=result.error or "rejected")
@@ -104,14 +126,16 @@ async def telegram_webhook(request: Request) -> dict[str, Any]:
 def register_telegram_webhook(app: FastAPI) -> None:
     """Build receiver + attach to app.state + mount router.
 
-    Called from server.py create_app(). Skips silently if
-    TELEGRAM_WEBHOOK_SECRET missing — allows dev/test environments
-    without the env-var to still create the app.
+    Round-2 MEDIUM-6: production-mode (HERMES_TELEGRAM_WEBHOOK_REQUIRED=1)
+    raises if TELEGRAM_WEBHOOK_SECRET missing. Dev/test mode silently skips.
     """
     try:
         receiver = build_receiver_from_env()
     except RuntimeError as exc:
-        log.warning("telegram_webhook NOT mounted: %s", exc)
+        if os.environ.get("HERMES_TELEGRAM_WEBHOOK_REQUIRED", "").strip() == "1":
+            log.error("telegram_webhook REQUIRED but config invalid: %s", exc)
+            raise
+        log.warning("telegram_webhook NOT mounted (dev-mode): %s", exc)
         return
     receiver.init_schema()
     app.state.telegram_receiver = receiver
