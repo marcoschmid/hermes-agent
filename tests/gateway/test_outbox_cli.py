@@ -255,3 +255,128 @@ def test_cli_quiet_suppresses_success_stdout(tmp_path: Path):
     assert err == ""
     row = _db_row(db, "quiet-1")
     assert row is not None
+
+
+# ---- Round-2 Fixes ---------------------------------------------------------
+
+
+def test_cli_accepts_legacy_dedupe_key_alias(tmp_path: Path):
+    """Round-2 CRITICAL-1: --dedupe-key (legacy safe_telegram_send syntax)
+    must work alongside --dedup-key."""
+    db = tmp_path / "outbox.db"
+    rc, out, err = _capture([
+        "--channel", "telegram",
+        "--dedupe-key", "legacy-syntax-test",  # NOT --dedup-key
+        "--message", "alias smoke",
+        "--db-path", str(db),
+    ])
+
+    assert rc == 0, err
+    row = _db_row(db, "legacy-syntax-test")
+    assert row is not None
+
+
+def test_cli_accepts_legacy_dedupe_window_silently(tmp_path: Path):
+    """Round-2 CRITICAL-1: --dedupe-window/--rate-limit-window/--buttons/--media
+    are silently accepted for migration compat (no longer applied — dedup_key
+    handles idempotency, Hub flapping-suppression handles rate-limit)."""
+    db = tmp_path / "outbox.db"
+    rc, _out, err = _capture([
+        "--channel", "telegram",
+        "--dedup-key", "legacy-flags",
+        "--message", "test",
+        "--dedupe-window", "86400",
+        "--rate-limit-window", "3600",
+        "--buttons", '[{"text":"OK"}]',
+        "--media", "/tmp/foo.png",
+        "--db-path", str(db),
+    ])
+
+    assert rc == 0, err
+    row = _db_row(db, "legacy-flags")
+    assert row is not None
+
+
+def test_cli_dedupe_collision_reports_deduped_true(tmp_path: Path):
+    """Round-2 MEDIUM-4: second enqueue with same dedup_key must report deduped=true."""
+    db = tmp_path / "outbox.db"
+    args1 = [
+        "--channel", "telegram",
+        "--dedup-key", "collision-test",
+        "--message", "first",
+        "--db-path", str(db),
+    ]
+    rc1, out1, _ = _capture(args1)
+    rc2, out2, err2 = _capture(args1[:-2] + ["--message", "second", "--db-path", str(db)])
+
+    assert rc1 == 0 and rc2 == 0
+    r1 = json.loads(out1)
+    r2 = json.loads(out2)
+    assert r1["deduped"] is False
+    assert r2["deduped"] is True
+    assert "already enqueued" in err2.lower()
+
+
+def test_cli_message_equals_form_for_leading_dash(tmp_path: Path):
+    """Round-2 MEDIUM-3: --message='-foo' (equals form) accepts leading-dash text."""
+    db = tmp_path / "outbox.db"
+    rc, _out, err = _capture([
+        "--channel", "telegram",
+        "--dedup-key", "leading-dash",
+        "--message=-Critical: 95% disk full",  # equals-form bypasses argparse next-flag scan
+        "--db-path", str(db),
+    ])
+
+    assert rc == 0, err
+    row = _db_row(db, "leading-dash")
+    payload = json.loads(row["payload_json"])
+    assert payload["message"] == "-Critical: 95% disk full"
+
+
+def test_cli_target_and_context_persist_in_payload(tmp_path: Path):
+    """Round-2 HIGH-2: --target/--context must reach payload so worker forwards
+    to direct-sender (override factory-default chat-id/context)."""
+    db = tmp_path / "outbox.db"
+    rc, _out, _err = _capture([
+        "--channel", "telegram",
+        "--target", "999888777",
+        "--context", "cert_expiry",
+        "--dedup-key", "target-ctx-test",
+        "--message", "test",
+        "--db-path", str(db),
+    ])
+
+    assert rc == 0
+    row = _db_row(db, "target-ctx-test")
+    payload = json.loads(row["payload_json"])
+    assert payload["target"] == "999888777"
+    assert payload["context"] == "cert_expiry"
+
+
+def test_cli_concurrent_init_schema_safe(tmp_path: Path):
+    """Round-2 MEDIUM-5: 2 callers race-init same DB (no-claim-token column) —
+    one ALTER wins, other tolerates duplicate-column error."""
+    # Pre-create pre-claim-token schema (legacy)
+    db = tmp_path / "outbox.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS outbox (
+        id TEXT PRIMARY KEY, channel TEXT NOT NULL, payload_json TEXT NOT NULL,
+        dedup_key TEXT NOT NULL, attempts INTEGER DEFAULT 0, last_error TEXT,
+        status TEXT NOT NULL, next_retry_at TEXT, created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX outbox_dedup_key_idx ON outbox(dedup_key);
+    """)
+    conn.close()
+
+    # Sequential init_schema calls (simulates 2 callers, race not deterministic
+    # but second call exercises duplicate-column path explicitly)
+    from gateway.outbox import OutboxStore
+    store1 = OutboxStore(str(db))
+    store1.init_schema()  # adds claim_token
+    store2 = OutboxStore(str(db))
+    store2.init_schema()  # claim_token already present — must not raise
+
+    cols = {row[1] for row in sqlite3.connect(str(db)).execute("PRAGMA table_info(outbox)").fetchall()}
+    assert "claim_token" in cols

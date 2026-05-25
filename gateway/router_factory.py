@@ -270,11 +270,15 @@ def make_direct_sender(
             return {"ok": False, "error": f"safe_telegram_send.sh missing at {resolved_path}"}
         issue = issue or {}
         dedupe_key = _dedupe_key_from(message, issue)
+        # Round-2 HIGH-2: caller-supplied target/context override factory-default.
+        # Critical for outbox-cli callers that pass --target X --context Y.
+        effective_target = str(issue.get("target") or target_chat_id)
+        effective_context = str(issue.get("context") or context)
         cmd = [
             "bash",
             resolved_path,
-            "--target", str(target_chat_id),
-            "--context", context,
+            "--target", effective_target,
+            "--context", effective_context,
             "--message", message,
             "--dedupe-key", dedupe_key,
         ]
