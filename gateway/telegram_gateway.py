@@ -87,6 +87,8 @@ class TelegramCallbackReceiver:
             ("last_error", "TEXT"),
             ("dispatch_status", "TEXT NOT NULL DEFAULT 'pending'"),
             ("next_retry_at", "TEXT"),
+            # Round-3 HIGH-1: zombie-recovery anchor for claimed rows
+            ("claimed_at", "TEXT"),
         ]:
             if col_name in cols:
                 continue

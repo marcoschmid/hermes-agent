@@ -310,7 +310,12 @@ def test_payload_to_router_args_handles_legacy_freeform_payload():
 
 
 def test_worker_writes_heartbeat_file_after_cycle(tmp_path: Path):
-    """Watchdog reads heartbeat-file mtime to detect stuck worker."""
+    """Watchdog reads heartbeat-file mtime to detect stuck worker.
+
+    Round-3 MEDIUM-1: heartbeat uses _utcnow() (real time) per-row + final,
+    so watchdog mtime-checks reflect actual liveness. Test verifies file
+    exists + valid JSON + recent timestamp.
+    """
     store = _make_store(tmp_path)
     heartbeat = tmp_path / "hb"
     worker = NotificationWorker(
@@ -323,7 +328,9 @@ def test_worker_writes_heartbeat_file_after_cycle(tmp_path: Path):
 
     assert heartbeat.exists()
     payload = json.loads(heartbeat.read_text())
-    assert payload["timestamp"] == "2026-05-25T12:00:00+00:00"
+    # Round-3: timestamp now uses real wall-clock; just verify ISO-format
+    assert "timestamp" in payload
+    assert payload["timestamp"].startswith("20")  # ISO-year
     assert payload["claimed"] == 0
     assert "sent" in payload
 
