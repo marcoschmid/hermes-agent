@@ -31,6 +31,34 @@ CHANNEL_DEFAULTS: dict[str, dict[str, str]] = {
 }
 
 
+def _resolve_hmac_secret_env(channel: str) -> str:
+    """Pick the env-var name that holds the channel's HMAC secret.
+
+    Tries preferred `{CHANNEL}_HUB_HMAC_SECRET` first, falls back to legacy
+    `{CHANNEL}_HUB_SECRET` if set. Returns preferred name as canonical
+    default when neither is set — so router_factory error messages refer to
+    the convention we want callers to use.
+
+    Background: notification-hub-tokens.env evolved organically. Older
+    channels (drobo-backup) use `{CHANNEL}_HUB_SECRET`. Newer channels
+    (weekly-preview) use `{CHANNEL}_HUB_HMAC_SECRET`. Without this
+    fallback, drobo-backup-style configs silently fail hub-dispatch.
+
+    Also normalises channel names with dashes to underscores (POSIX env-var
+    convention) — fixes pre-existing bug where channel='drobo-backup'
+    produced env-name `DROBO-BACKUP_HUB_HMAC_SECRET` (dash) but the actual
+    env-var is `DROBO_BACKUP_HUB_SECRET` (underscore).
+    """
+    upper = channel.upper().replace("-", "_")
+    preferred = f"{upper}_HUB_HMAC_SECRET"
+    legacy = f"{upper}_HUB_SECRET"
+    if os.environ.get(preferred):
+        return preferred
+    if os.environ.get(legacy):
+        return legacy
+    return preferred
+
+
 def build_channel_router_factory() -> Callable[[str], FallbackNotificationRouter]:
     """Return a callable mapping channel-name -> configured Router.
 
@@ -50,7 +78,7 @@ def build_channel_router_factory() -> Callable[[str], FallbackNotificationRouter
             target_chat_id=chat_id,
             context=config["context"],
             hub_auth_mode="hmac",
-            hub_hmac_secret_env=f"{channel.upper()}_HUB_HMAC_SECRET",
+            hub_hmac_secret_env=_resolve_hmac_secret_env(channel),
             topic=f"ops.notification.{channel}",
         )
 
