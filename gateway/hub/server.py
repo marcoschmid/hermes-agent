@@ -16,6 +16,7 @@ from gateway.hub.adapter_registry import close_adapters
 from gateway.hub.hub_state import connect as hub_state_connect
 from gateway.hub.mount import register_hub_routes
 from gateway.hub.nonce_store import prune_old
+from gateway.hub.telegram_webhook_route import register_telegram_webhook
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,9 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="Hermes Notification Hub", version="v4a", lifespan=lifespan)
     register_hub_routes(app)
+    # P4 Track B: Telegram callback webhook (silently-skipped if
+    # TELEGRAM_WEBHOOK_SECRET unset — dev/test environments still boot).
+    register_telegram_webhook(app)
     return app
 
 
