@@ -277,9 +277,13 @@ def test_cli_accepts_legacy_dedupe_key_alias(tmp_path: Path):
 
 
 def test_cli_accepts_legacy_dedupe_window_silently(tmp_path: Path):
-    """Round-2 CRITICAL-1: --dedupe-window/--rate-limit-window/--buttons/--media
+    """Round-2 CRITICAL-1: --dedupe-window/--rate-limit-window/--media
     are silently accepted for migration compat (no longer applied — dedup_key
-    handles idempotency, Hub flapping-suppression handles rate-limit)."""
+    handles idempotency, Hub flapping-suppression handles rate-limit).
+
+    Note: --buttons is no longer in this silent-ignore list. It is now
+    actively persisted to payload (see test_cli_buttons_persists_in_payload).
+    """
     db = tmp_path / "outbox.db"
     rc, _out, err = _capture([
         "--channel", "telegram",
@@ -287,7 +291,6 @@ def test_cli_accepts_legacy_dedupe_window_silently(tmp_path: Path):
         "--message", "test",
         "--dedupe-window", "86400",
         "--rate-limit-window", "3600",
-        "--buttons", '[{"text":"OK"}]',
         "--media", "/tmp/foo.png",
         "--db-path", str(db),
     ])
@@ -295,6 +298,68 @@ def test_cli_accepts_legacy_dedupe_window_silently(tmp_path: Path):
     assert rc == 0, err
     row = _db_row(db, "legacy-flags")
     assert row is not None
+
+
+def test_cli_buttons_persists_in_payload(tmp_path: Path):
+    """P4 Track A2 Wave-1 Buttons-Extension: --buttons JSON-array must persist
+    into payload so notification_worker can forward to direct-sender for
+    inline-keyboard rendering by safe_telegram_send.sh.
+
+    Required for task_monitor_watchdog.sh migration (uses --buttons for
+    approve/retry/ack callbacks).
+    """
+    db = tmp_path / "outbox.db"
+    buttons_json = (
+        '[[{"text":"Show","callback_data":"task_monitor_stalled"},'
+        '{"text":"Retry","callback_data":"task_monitor_retry"}],'
+        '[{"text":"Ack","callback_data":"task_monitor_ack"}]]'
+    )
+    rc, _out, err = _capture([
+        "--channel", "telegram",
+        "--target", "128314698",
+        "--dedup-key", "buttons-persist-test",
+        "--message", "stalled tasks",
+        "--buttons", buttons_json,
+        "--db-path", str(db),
+    ])
+
+    assert rc == 0, err
+    row = _db_row(db, "buttons-persist-test")
+    payload = json.loads(row["payload_json"])
+    assert "buttons" in payload, "buttons must be persisted in payload"
+    assert payload["buttons"] == json.loads(buttons_json)
+
+
+def test_cli_buttons_invalid_json_returns_exit_2(tmp_path: Path):
+    """--buttons malformed-JSON must exit 2 with clear error (caller bug,
+    not silent-drop)."""
+    db = tmp_path / "outbox.db"
+    rc, _out, err = _capture([
+        "--channel", "telegram",
+        "--dedup-key", "buttons-bad-json",
+        "--message", "test",
+        "--buttons", "not-a-json-array",
+        "--db-path", str(db),
+    ])
+
+    assert rc == 2
+    assert "buttons" in err.lower()
+
+
+def test_cli_buttons_non_array_returns_exit_2(tmp_path: Path):
+    """--buttons must be a JSON array (Telegram inline-keyboard convention).
+    Non-array (e.g. object, string) must exit 2."""
+    db = tmp_path / "outbox.db"
+    rc, _out, err = _capture([
+        "--channel", "telegram",
+        "--dedup-key", "buttons-not-array",
+        "--message", "test",
+        "--buttons", '{"text":"OK"}',  # object, not array
+        "--db-path", str(db),
+    ])
+
+    assert rc == 2
+    assert "array" in err.lower() or "buttons" in err.lower()
 
 
 def test_cli_dedupe_collision_reports_deduped_true(tmp_path: Path):

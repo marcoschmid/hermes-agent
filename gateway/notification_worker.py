@@ -222,8 +222,10 @@ def _payload_to_router_args(row: OutboxRow) -> tuple[str, dict[str, Any]]:
         }
         # Round-2 HIGH-2: per-call target/context must reach direct-sender.
         # Otherwise caller --target X --context Y dispatches to factory-default.
+        # P4 Track A2 Wave-1: buttons forwarded for Telegram inline-keyboard
+        # via direct-sender (safe_telegram_send.sh --buttons).
         for key in ("title", "audience", "labels", "topic", "severity",
-                    "target", "context"):
+                    "target", "context", "buttons"):
             if key in payload:
                 issue[key] = payload[key]
         return message, issue
