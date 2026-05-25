@@ -235,6 +235,72 @@ def test_dispatcher_run_forever_stops_on_signal(tmp_path: Path):
     assert not thread.is_alive()
 
 
+def test_dispatcher_recovers_claimed_zombies(tmp_path: Path):
+    """Round-3 HIGH-1: SIGKILL during dispatch leaves row claimed; recovery
+    must transition to pending + backoff + attempts++ on next cycle."""
+    import sqlite3 as _sqlite3
+    db = _make_receiver_with_rows(tmp_path, [
+        {"id": "cb-zombie", "data": "approve:ISS-zombie"},
+    ])
+    handler_skip = MagicMock()
+    dispatcher = TelegramActionDispatcher(
+        db_path=str(db),
+        handlers={"approve": handler_skip, "reject": MagicMock(), "skip": MagicMock()},
+        zombie_timeout_seconds=300,
+    )
+
+    enq_time = datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc)
+    with _sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "UPDATE telegram_callbacks SET dispatch_status='claimed', "
+            "claim_token='stale-tok', claimed_at=? WHERE callback_id=?",
+            (enq_time.isoformat(), "cb-zombie"),
+        )
+
+    recovery_time = enq_time + timedelta(minutes=10)
+    stats = dispatcher.run_once(now=recovery_time)
+
+    assert stats.zombie_recovered == 1
+    handler_skip.assert_not_called()
+
+    row = _row(db, "cb-zombie")
+    assert row["dispatch_status"] == "pending"
+    assert row["attempts"] == 1
+    assert row["last_error"] == "zombie recovered"
+    assert row["claim_token"] is None
+    assert row["claimed_at"] is None
+
+
+def test_dispatcher_zombie_recovery_dead_letters_after_threshold(tmp_path: Path):
+    """Round-3 HIGH-1: zombie at attempts=4 (5th recovery) → dead-lettered."""
+    import sqlite3 as _sqlite3
+    db = _make_receiver_with_rows(tmp_path, [
+        {"id": "cb-zombie-dl", "data": "approve:ISS-dl"},
+    ])
+    dispatcher = TelegramActionDispatcher(
+        db_path=str(db),
+        handlers={"approve": MagicMock(), "reject": MagicMock(), "skip": MagicMock()},
+        zombie_timeout_seconds=300,
+        dead_letter_threshold=5,
+    )
+
+    enq_time = datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc)
+    with _sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "UPDATE telegram_callbacks SET dispatch_status='claimed', "
+            "claim_token='t', claimed_at=?, attempts=4 WHERE callback_id=?",
+            (enq_time.isoformat(), "cb-zombie-dl"),
+        )
+
+    recovery_time = enq_time + timedelta(minutes=10)
+    stats = dispatcher.run_once(now=recovery_time)
+
+    assert stats.zombie_recovered == 1
+    row = _row(db, "cb-zombie-dl")
+    assert row["dispatch_status"] == "dead-lettered"
+    assert row["attempts"] == 5
+
+
 def test_dispatcher_batch_size_limits_rows_per_cycle(tmp_path: Path):
     callbacks = [{"id": f"cb-batch-{i}", "data": f"approve:ISS-{i}"} for i in range(10)]
     db = _make_receiver_with_rows(tmp_path, callbacks)

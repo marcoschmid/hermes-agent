@@ -85,8 +85,12 @@ class NotificationWorker:
                          "(will be re-claimed via zombie-recovery)", stats.claimed - stats.sent - stats.failed)
                 break
             self._dispatch_row(row, now=now, stats=stats)
+            # Round-3 MEDIUM-1: heartbeat per-row prevents watchdog false-restart
+            # during slow batches (router-cascade can take up to ~40s per row).
+            self._write_heartbeat(now=_utcnow(), stats=stats)
 
-        self._write_heartbeat(now=now, stats=stats)
+        # Final heartbeat after batch (covers empty-cycles + post-shutdown)
+        self._write_heartbeat(now=_utcnow(), stats=stats)
         return stats
 
     def _write_heartbeat(self, *, now: datetime, stats: CycleStats) -> None:

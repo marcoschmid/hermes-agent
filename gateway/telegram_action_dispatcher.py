@@ -48,6 +48,9 @@ DEAD_LETTER_THRESHOLD = 5
 BACKOFF_BASE_SECONDS = 30
 BACKOFF_MAX_SECONDS = 3600
 BUSY_TIMEOUT_MS = 30000
+# Round-3 HIGH-1: claimed-stuck rows recovery (worker SIGKILL mid-dispatch).
+# Default 300s = 5min. Matches notification_worker zombie-pattern.
+ZOMBIE_CLAIM_TIMEOUT_SECONDS = 300
 
 
 ActionHandler = Callable[[str, dict[str, Any]], None]
@@ -60,6 +63,7 @@ class CycleStats:
     dispatched: int = 0
     failed: int = 0
     dead_lettered: int = 0
+    zombie_recovered: int = 0
 
 
 class TelegramActionDispatcher:
@@ -78,18 +82,22 @@ class TelegramActionDispatcher:
         poll_interval: float = POLL_INTERVAL_SECONDS,
         batch_size: int = CLAIM_BATCH_SIZE,
         dead_letter_threshold: int = DEAD_LETTER_THRESHOLD,
+        zombie_timeout_seconds: int = ZOMBIE_CLAIM_TIMEOUT_SECONDS,
     ) -> None:
         self._db_path = str(db_path)
         self._handlers = handlers
         self._poll_interval = poll_interval
         self._batch_size = batch_size
         self._dead_letter_threshold = dead_letter_threshold
+        self._zombie_timeout = zombie_timeout_seconds
         self._shutdown_event = threading.Event()
 
     def run_once(self, *, now: datetime | None = None) -> CycleStats:
         """Process one batch atomically (claim → dispatch → mark)."""
         now = now or _utcnow()
         stats = CycleStats()
+        # Round-3 HIGH-1: recover claimed-stuck rows BEFORE new claims
+        stats.zombie_recovered = self._recover_claimed_zombies(now=now)
         rows = self._claim_due(now=now)
         stats.claimed = len(rows)
         for row in rows:
@@ -101,21 +109,61 @@ class TelegramActionDispatcher:
         return stats
 
     @_retry_on_locked
+    def _recover_claimed_zombies(self, *, now: datetime) -> int:
+        """Recover claimed-stuck rows (handler-SIGKILL mid-dispatch).
+
+        Round-3 HIGH-1: claimed rows past zombie_timeout get reverted to
+        pending+backoff+attempts++ (analog OutboxStore.recover_zombies).
+        Dead-letter at threshold prevents infinite-retry on permanent-killers.
+        """
+        cutoff = _iso(now - timedelta(seconds=self._zombie_timeout))
+        ts = _iso(now)
+        recovered = 0
+        with closing(self._conn()) as conn:
+            zombies = conn.execute(
+                "SELECT callback_id, attempts FROM telegram_callbacks "
+                "WHERE dispatch_status='claimed' AND claimed_at < ?",
+                (cutoff,),
+            ).fetchall()
+            for z in zombies:
+                rid = z["callback_id"]
+                attempts = (z["attempts"] or 0) + 1
+                if attempts >= self._dead_letter_threshold:
+                    new_status = "dead-lettered"
+                    next_retry = None
+                else:
+                    new_status = "pending"
+                    backoff = min(BACKOFF_MAX_SECONDS,
+                                  BACKOFF_BASE_SECONDS * (2 ** (attempts - 1)))
+                    next_retry = _iso(now + timedelta(seconds=backoff))
+                cursor = conn.execute(
+                    "UPDATE telegram_callbacks SET dispatch_status=?, attempts=?, "
+                    "last_error=?, next_retry_at=?, claim_token=NULL, claimed_at=NULL "
+                    "WHERE callback_id=? AND dispatch_status='claimed'",
+                    (new_status, attempts, "zombie recovered", next_retry, rid),
+                )
+                if cursor.rowcount:
+                    recovered += 1
+        return recovered
+
+    @_retry_on_locked
     def _claim_due(self, *, now: datetime) -> list[dict]:
-        """Atomic claim: UPDATE pending rows due now to status='claimed' with fresh token."""
+        """Atomic claim: UPDATE pending rows due now to status='claimed' with fresh token.
+        Round-3 HIGH-1: claimed_at captures claim-timestamp for zombie-recovery.
+        """
         ts = _iso(now)
         token = uuid.uuid4().hex
         with closing(self._conn()) as conn:
             cursor = conn.execute(
                 "UPDATE telegram_callbacks "
-                "SET dispatch_status='claimed', claim_token=? "
+                "SET dispatch_status='claimed', claim_token=?, claimed_at=? "
                 "WHERE callback_id IN ("
                 "  SELECT callback_id FROM telegram_callbacks "
                 "  WHERE dispatch_status='pending' AND accepted=1 "
                 "    AND (next_retry_at IS NULL OR next_retry_at<=?) "
                 "  ORDER BY received_at ASC LIMIT ?"
                 ") RETURNING *",
-                (token, ts, self._batch_size),
+                (token, ts, ts, self._batch_size),
             )
             return [dict(r) for r in cursor.fetchall()]
 
@@ -157,7 +205,7 @@ class TelegramActionDispatcher:
         with closing(self._conn()) as conn:
             cursor = conn.execute(
                 "UPDATE telegram_callbacks SET dispatch_status='processed', "
-                "processed_at=?, claim_token=NULL "
+                "processed_at=?, claim_token=NULL, claimed_at=NULL "
                 "WHERE callback_id=? AND claim_token=?",
                 (ts, callback_id, claim_token),
             )
@@ -171,7 +219,7 @@ class TelegramActionDispatcher:
         with closing(self._conn()) as conn:
             conn.execute(
                 "UPDATE telegram_callbacks SET dispatch_status='failed', "
-                "last_error=?, processed_at=?, claim_token=NULL "
+                "last_error=?, processed_at=?, claim_token=NULL, claimed_at=NULL "
                 "WHERE callback_id=? AND claim_token=?",
                 (error, ts, callback_id, claim_token),
             )
@@ -194,7 +242,7 @@ class TelegramActionDispatcher:
             if attempts >= self._dead_letter_threshold:
                 conn.execute(
                     "UPDATE telegram_callbacks SET dispatch_status='dead-lettered', "
-                    "attempts=?, last_error=?, processed_at=?, claim_token=NULL "
+                    "attempts=?, last_error=?, processed_at=?, claim_token=NULL, claimed_at=NULL "
                     "WHERE callback_id=? AND claim_token=?",
                     (attempts, error, ts, callback_id, claim_token),
                 )
@@ -204,7 +252,7 @@ class TelegramActionDispatcher:
             next_retry = _iso(now + timedelta(seconds=backoff))
             conn.execute(
                 "UPDATE telegram_callbacks SET dispatch_status='pending', "
-                "attempts=?, last_error=?, next_retry_at=?, claim_token=NULL "
+                "attempts=?, last_error=?, next_retry_at=?, claim_token=NULL, claimed_at=NULL "
                 "WHERE callback_id=? AND claim_token=?",
                 (attempts, error, next_retry, callback_id, claim_token),
             )

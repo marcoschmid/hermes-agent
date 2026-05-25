@@ -2,7 +2,7 @@
 
 Persistent + cascading + auditable Notification-Delivery für Hermes-Agent.
 
-10 PRs merged 2026-05-23 bis 2026-05-25. 118/118 contract-tests grün.
+14 PRs merged 2026-05-23 bis 2026-05-25 (Phase-4 + Round-3 hardening). 135+ contract-tests grün.
 
 ---
 
@@ -197,6 +197,36 @@ LaunchAgent `de.marcoschmid.hermes-telegram-action-dispatcher` runs as marco-use
 5. Permanent-fail (no handler) → dispatch_status='failed' (no retry)
 
 ---
+
+## Permission-Boundary (CRITICAL pre-install)
+
+**ALL DB-actors MUST run as SAME user** (default: `marco`). Mixing UIDs
+(e.g. Hermes-Hub als `_hermes` writes to outbox.db; Worker als `marco`
+reads same path) causes:
+- WAL/SHM file-permission errors
+- SQLite-lock-state mismatch
+- Silent data-loss on writes that worker can't read back
+
+If Hermes-Hub migrates to `_hermes` UID (per G2-Stufe-2 plan), ALSO migrate
+worker + dispatcher + cleanup to `_hermes` (LaunchAgent UserName override
+or LaunchDaemon under `/Library/LaunchDaemons/`). Update env-vars
+`HERMES_OUTBOX_DB` + `TELEGRAM_CALLBACKS_DB` to shared path with explicit
+group + ACL for both processes.
+
+Plist templates use `/Users/marco/...` absolute paths — Marco-specific
+deployment. For other users: edit plist `ProgramArguments` + adjust
+`EnvironmentVariables.HOME`.
+
+## LaunchAgent Install-Order (dependency-sensitive)
+
+1. **Worker first** (`de.marcoschmid.hermes-notification-worker`) — creates
+   outbox.db schema on first claim_due. Required-before bash-callers migrate
+   to outbox-enqueue (else silent backlog).
+2. **Worker-Watchdog** (`...-watchdog`) — monitors worker heartbeat.
+   Requires worker-plist-path correctness in watchdog script env-vars.
+3. **Telegram-Action-Dispatcher** — independent of worker; can install in
+   parallel. Required before bot-webhook setWebhook cutover.
+4. **DB-Cleanup** — last; both DBs must exist. Otherwise silently no-ops.
 
 ## LaunchAgents (Marco-Install)
 
