@@ -1,0 +1,25 @@
+#!/bin/bash
+# outbox-enqueue: bash-shim für gateway.outbox_cli (P4 Track A2).
+#
+# Drop-in replacement für safe_telegram_send.sh in bash-Callern:
+#   $OUTBOX_CLI --channel telegram --target X --context Y --dedupe-key Z --message M
+#
+# Sucht hermes-agent.venv-python; falls fehlt fällt auf /opt/homebrew/bin/python3
+# bzw. /usr/bin/python3 zurück.
+#
+# Install via symlink: ln -sf ~/Code/hermes-agent/scripts/outbox-enqueue \
+#   ~/.openclaw/bin/outbox-enqueue
+set -euo pipefail
+
+HERMES_AGENT_ROOT="${HERMES_AGENT_ROOT:-${HOME}/Code/hermes-agent}"
+PY="${HERMES_AGENT_ROOT}/.venv/bin/python"
+[ -x "${PY}" ] || PY="/opt/homebrew/bin/python3"
+[ -x "${PY}" ] || PY="/usr/bin/python3"
+
+if [ ! -x "${PY}" ]; then
+  echo "ERROR: no python3 found (.venv, /opt/homebrew, /usr/bin)" >&2
+  exit 1
+fi
+
+export PYTHONPATH="${HERMES_AGENT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+exec "${PY}" -m gateway.outbox_cli "$@"
