@@ -41,6 +41,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from ._sqlite_helpers import iso as _strict_iso, utcnow as _utcnow
+
+
+def _iso(dt: datetime) -> str:
+    """Lenient ISO formatter — preserves pre-refactor behavior."""
+    return _strict_iso(dt, strict_aware=False)
+
 log = logging.getLogger(__name__)
 
 # Default retention (days) per status. None = retain-forever.
@@ -84,16 +91,6 @@ class CleanupStats:
     skipped_protected: int = 0
     remaining_eligible: int = 0
     dead_letter_alert: bool = False
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _iso(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
 
 
 def _connect(db_path: str) -> sqlite3.Connection:

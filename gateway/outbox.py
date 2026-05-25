@@ -22,12 +22,13 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-import time
 import uuid
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any
+
+from ._sqlite_helpers import iso as _iso, retry_on_locked, utcnow as _utcnow
 
 
 DEAD_LETTER_THRESHOLD = 5
@@ -35,8 +36,8 @@ BACKOFF_BASE_SECONDS = 30
 BACKOFF_MAX_SECONDS = 3600
 BUSY_TIMEOUT_MS = 30000
 CONNECT_TIMEOUT_SECONDS = 30
-LOCK_RETRY_MAX = 5
-LOCK_RETRY_BASE_SLEEP = 0.1
+# Re-export aliases for backward-compat with private importers
+_retry_on_locked = retry_on_locked
 
 logger = logging.getLogger(__name__)
 
@@ -54,20 +55,6 @@ class OutboxRow:
     created_at: str
     updated_at: str
     claim_token: str | None = None
-
-
-def _retry_on_locked(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Retry SQLite operations on 'database is locked' OperationalError."""
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        for attempt in range(LOCK_RETRY_MAX):
-            try:
-                return fn(*args, **kwargs)
-            except sqlite3.OperationalError as exc:
-                if "locked" not in str(exc).lower() or attempt == LOCK_RETRY_MAX - 1:
-                    raise
-                time.sleep(LOCK_RETRY_BASE_SLEEP * (2 ** attempt))
-        raise RuntimeError("unreachable")
-    return wrapper
 
 
 class OutboxStore:
@@ -328,16 +315,6 @@ CREATE TABLE IF NOT EXISTS outbox (
 CREATE UNIQUE INDEX IF NOT EXISTS outbox_dedup_key_idx ON outbox(dedup_key);
 CREATE INDEX IF NOT EXISTS outbox_due_idx ON outbox(status, next_retry_at);
 """
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _iso(dt: datetime) -> str:
-    if dt.tzinfo is None or dt.utcoffset() is None:
-        raise ValueError("timezone-aware datetime required")
-    return dt.astimezone(timezone.utc).isoformat()
 
 
 def _row_to_dataclass(row: sqlite3.Row) -> OutboxRow:
