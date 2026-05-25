@@ -423,6 +423,92 @@ def test_direct_sender_whitespace_id_falls_back_to_hash(tmp_path):
     assert len(cmd[dedupe_idx]) == 32
 
 
+# ---- P4 Track A2 Wave-1: Buttons-Extension ---------------------------------
+
+
+def test_direct_sender_passes_buttons_to_subprocess(tmp_path):
+    """P4 Track A2 Wave-1: issue['buttons'] must be passed as --buttons JSON
+    to safe_telegram_send.sh subprocess for inline-keyboard rendering."""
+    fake_script = tmp_path / "safe_telegram_send.sh"
+    fake_script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_script.chmod(0o755)
+
+    sender = make_direct_sender(
+        script_path=str(fake_script),
+        target_chat_id="128314698",
+        context="task_monitor",
+    )
+
+    buttons = [[{"text": "Show", "callback_data": "task_monitor_stalled"}]]
+    fake_result = subprocess.CompletedProcess(
+        args=["bash", str(fake_script)], returncode=0, stdout="", stderr="",
+    )
+    with patch("gateway.router_factory.subprocess.run", return_value=fake_result) as mock_run:
+        result = sender("stalled", issue={"id": "t-1", "buttons": buttons})
+
+    assert result["ok"] is True
+    cmd = mock_run.call_args.args[0]
+    assert "--buttons" in cmd
+    buttons_idx = cmd.index("--buttons") + 1
+    assert json.loads(cmd[buttons_idx]) == buttons
+
+
+def test_direct_sender_omits_buttons_when_not_in_issue(tmp_path):
+    """Backward-compat: callers without buttons see no --buttons arg
+    (avoids passing empty/null to safe_telegram_send.sh)."""
+    fake_script = tmp_path / "safe_telegram_send.sh"
+    fake_script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_script.chmod(0o755)
+
+    sender = make_direct_sender(
+        script_path=str(fake_script),
+        target_chat_id="128314698",
+        context="cert_expiry",
+    )
+
+    fake_result = subprocess.CompletedProcess(
+        args=["bash", str(fake_script)], returncode=0, stdout="", stderr="",
+    )
+    with patch("gateway.router_factory.subprocess.run", return_value=fake_result) as mock_run:
+        sender("hello", issue={"id": "c-1"})
+
+    cmd = mock_run.call_args.args[0]
+    assert "--buttons" not in cmd
+
+
+def test_hub_sender_refuses_buttons_payload():
+    """P4 Track A2 Wave-1: Hub-side does not yet support inline-keyboards.
+    To prevent silent buttons-drop, hub_sender returns ok=False when issue
+    carries buttons, forcing cascade fallback to direct-sender (which uses
+    safe_telegram_send.sh with --buttons)."""
+    sender = make_hub_sender(
+        hub_url="http://127.0.0.1:8766",
+        bearer_token="hub-tok",
+        source_slug="task-monitor",
+    )
+
+    # No HTTP call expected — refused before network
+    result = sender("stalled", issue={"id": "t-1", "buttons": [[{"text": "OK"}]]})
+
+    assert result["ok"] is False
+    assert "buttons" in result["error"].lower()
+
+
+def test_mc_sender_refuses_buttons_payload():
+    """P4 Track A2 Wave-1: MC audit-only sink also does not push buttons.
+    Refuse forces cascade fallback to direct-sender."""
+    sender = make_mc_sender(
+        mc_url="http://127.0.0.1:3334",
+        bearer_token="mc-tok",
+        source_slug="task-monitor",
+    )
+
+    result = sender("stalled", issue={"id": "t-1", "buttons": [[{"text": "OK"}]]})
+
+    assert result["ok"] is False
+    assert "buttons" in result["error"].lower()
+
+
 # ---- Default router builder ------------------------------------------------
 
 

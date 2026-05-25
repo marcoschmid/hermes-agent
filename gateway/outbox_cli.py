@@ -73,11 +73,14 @@ def build_parser() -> argparse.ArgumentParser:
     # mechanical migration of bash callers succeeds without rewriting their args.
     # These options no longer apply in async-enqueue world (Worker + Outbox handle
     # dedupe-window via dedup_key + Hub flapping-suppression; rate-limit via Hub
-    # per-source config; buttons via channel-specific renderer).
+    # per-source config).
     p.add_argument("--dedupe-window", help=argparse.SUPPRESS)
     p.add_argument("--rate-limit-window", help=argparse.SUPPRESS)
-    p.add_argument("--buttons", help=argparse.SUPPRESS)
     p.add_argument("--media", help=argparse.SUPPRESS)
+    # P4 Track A2 Wave-1: --buttons persisted to payload for Telegram
+    # inline-keyboard rendering via direct-sender (safe_telegram_send.sh).
+    p.add_argument("--buttons",
+                   help="Inline-keyboard JSON array (Telegram-style buttons).")
     return p
 
 
@@ -107,6 +110,14 @@ def _build_payload(args: argparse.Namespace) -> dict[str, Any]:
         payload["target"] = args.target
     if args.context:
         payload["context"] = args.context
+    if args.buttons:
+        try:
+            buttons = json.loads(args.buttons)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--buttons must be valid JSON: {exc}") from None
+        if not isinstance(buttons, list):
+            raise ValueError("--buttons must be a JSON array (Telegram inline-keyboard convention)")
+        payload["buttons"] = buttons
     return payload
 
 

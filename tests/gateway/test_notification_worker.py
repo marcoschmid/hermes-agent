@@ -370,6 +370,34 @@ def test_payload_to_router_args_forwards_target_and_context():
     assert issue["title"] == "T"
 
 
+def test_payload_to_router_args_forwards_buttons():
+    """P4 Track A2 Wave-1: buttons from outbox payload must reach issue dict
+    so direct-sender invokes safe_telegram_send.sh with --buttons arg.
+
+    Without this forwarding, task_monitor_watchdog.sh + similar callers would
+    lose their inline-keyboard on migration (silent regression).
+    """
+    from gateway.outbox import OutboxRow
+    buttons_value = [
+        [{"text": "Show", "callback_data": "task_monitor_stalled"},
+         {"text": "Retry", "callback_data": "task_monitor_retry"}],
+        [{"text": "Ack", "callback_data": "task_monitor_ack"}],
+    ]
+    row = OutboxRow(
+        id="row-buttons", channel="telegram",
+        payload_json=json.dumps({
+            "message": "stalled tasks",
+            "buttons": buttons_value,
+        }),
+        dedup_key="d-buttons", attempts=0, last_error=None, status="claimed",
+        next_retry_at=None, created_at="2026-05-25T12:00:00Z",
+        updated_at="2026-05-25T12:00:00Z",
+    )
+    message, issue = _payload_to_router_args(row)
+    assert message == "stalled tasks"
+    assert issue["buttons"] == buttons_value
+
+
 # ---- Round-2 fence tests ----------------------------------------------------
 
 

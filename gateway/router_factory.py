@@ -148,6 +148,16 @@ def make_hub_sender(
     endpoint = hub_url.rstrip("/") + "/v1/notifications"
 
     def sender(message: str, issue: dict[str, Any] | None = None, **_: Any) -> dict[str, Any]:
+        # P4 Track A2 Wave-1: Hub-side inline-keyboard rendering not yet
+        # implemented in NotificationIntent schema. Refuse early when buttons
+        # present so cascade falls through to direct-sender (which uses
+        # safe_telegram_send.sh --buttons and DOES render). Without this
+        # refuse, Hub silently delivers message text without buttons, and
+        # cascade stops at hub.ok=True — user gets degraded UX without
+        # action-buttons. Remove once Hub TelegramAdapter handles
+        # payload['buttons'] -> reply_markup natively.
+        if issue and issue.get("buttons"):
+            return {"ok": False, "error": "hub: buttons not yet supported (forcing fallback)"}
         if auth_mode == "bearer":
             token = _resolve_token(direct_value=bearer_token, env_var=bearer_token_env)
             if not token:
@@ -221,6 +231,14 @@ def make_mc_sender(
     endpoint = mc_url.rstrip("/") + "/api/board/notifications/events"
 
     def sender(message: str, issue: dict[str, Any] | None = None, **_: Any) -> dict[str, Any]:
+        # P4 Track A2 Wave-1: MC audit-only sink does not push to Telegram and
+        # has no button-rendering. Refuse when buttons present so cascade
+        # advances to direct-sender (safe_telegram_send.sh --buttons).
+        # Without this, cascade would stop at MC.ok=True (audit-stored) and
+        # user never receives the button-alert.
+        if issue and issue.get("buttons"):
+            return {"ok": False, "error": "mc: buttons not supported (forcing fallback)"}
+
         token = _resolve_token(direct_value=bearer_token, env_var=bearer_token_env)
         if not token:
             return {"ok": False, "error": "mc: bearer_token missing"}
@@ -282,6 +300,12 @@ def make_direct_sender(
             "--message", message,
             "--dedupe-key", dedupe_key,
         ]
+        # P4 Track A2 Wave-1: forward inline-keyboard (Telegram buttons) to
+        # safe_telegram_send.sh as --buttons JSON-array. Required for
+        # task_monitor_watchdog.sh + similar callers post outbox-migration.
+        buttons = issue.get("buttons")
+        if buttons:
+            cmd.extend(["--buttons", json.dumps(buttons)])
 
         try:
             result = subprocess.run(
