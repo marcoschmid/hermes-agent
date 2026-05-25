@@ -18,12 +18,18 @@ from __future__ import annotations
 import hmac
 import logging
 import sqlite3
-import time
 from collections import deque
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any
+
+from ._sqlite_helpers import iso as _strict_iso, retry_on_locked, utcnow as _utcnow
+
+
+def _iso(dt: datetime) -> str:
+    """Lenient ISO formatter — preserves pre-refactor behavior (naive=UTC silently)."""
+    return _strict_iso(dt, strict_aware=False)
 
 log = logging.getLogger(__name__)
 
@@ -31,8 +37,8 @@ SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
 KNOWN_CALLBACK_TYPES = frozenset({"approve", "reject", "skip"})
 BUSY_TIMEOUT_MS = 30000
 CONNECT_TIMEOUT_SECONDS = 30
-LOCK_RETRY_MAX = 5
-LOCK_RETRY_BASE_SLEEP = 0.1
+# Re-export for backward-compat
+_retry_on_locked = retry_on_locked
 
 
 @dataclass(slots=True)
@@ -45,20 +51,6 @@ class CallbackResult:
     callback_type: str = ""
     issue_id: str = ""
     error: str = ""
-
-
-def _retry_on_locked(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Retry SQLite ops on 'database is locked' OperationalError."""
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        for attempt in range(LOCK_RETRY_MAX):
-            try:
-                return fn(*args, **kwargs)
-            except sqlite3.OperationalError as exc:
-                if "locked" not in str(exc).lower() or attempt == LOCK_RETRY_MAX - 1:
-                    raise
-                time.sleep(LOCK_RETRY_BASE_SLEEP * (2 ** attempt))
-        raise RuntimeError("unreachable")
-    return wrapper
 
 
 class TelegramCallbackReceiver:
@@ -262,16 +254,6 @@ CREATE TABLE IF NOT EXISTS telegram_callbacks (
 CREATE INDEX IF NOT EXISTS telegram_callbacks_user_received_idx
     ON telegram_callbacks(user_id, received_at);
 """
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _iso(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.isoformat()
 
 
 def _as_dict(value: Any) -> dict[str, Any]:

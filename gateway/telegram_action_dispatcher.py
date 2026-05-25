@@ -23,12 +23,22 @@ import logging
 import signal
 import sqlite3
 import threading
-import time
 import uuid
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+
+from ._sqlite_helpers import (
+    iso as _strict_iso,
+    retry_on_locked as _retry_on_locked,
+    utcnow as _utcnow,
+)
+
+
+def _iso(dt: datetime) -> str:
+    """Lenient ISO formatter — preserves pre-refactor behavior."""
+    return _strict_iso(dt, strict_aware=False)
 
 log = logging.getLogger(__name__)
 
@@ -38,8 +48,6 @@ DEAD_LETTER_THRESHOLD = 5
 BACKOFF_BASE_SECONDS = 30
 BACKOFF_MAX_SECONDS = 3600
 BUSY_TIMEOUT_MS = 30000
-LOCK_RETRY_MAX = 5
-LOCK_RETRY_BASE_SLEEP = 0.1
 
 
 ActionHandler = Callable[[str, dict[str, Any]], None]
@@ -52,19 +60,6 @@ class CycleStats:
     dispatched: int = 0
     failed: int = 0
     dead_lettered: int = 0
-
-
-def _retry_on_locked(fn):
-    def wrapper(*args, **kwargs):
-        for attempt in range(LOCK_RETRY_MAX):
-            try:
-                return fn(*args, **kwargs)
-            except sqlite3.OperationalError as exc:
-                if "locked" not in str(exc).lower() or attempt == LOCK_RETRY_MAX - 1:
-                    raise
-                time.sleep(LOCK_RETRY_BASE_SLEEP * (2 ** attempt))
-        raise RuntimeError("unreachable")
-    return wrapper
 
 
 class TelegramActionDispatcher:
@@ -252,11 +247,3 @@ class TelegramActionDispatcher:
                 pass
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _iso(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()

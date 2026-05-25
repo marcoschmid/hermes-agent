@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from ._sqlite_helpers import utcnow as _utcnow
 from .fallback_channels import FallbackNotificationRouter, SendResult
 from .outbox import OutboxRow, OutboxStore
 
@@ -226,5 +227,3 @@ def _payload_to_router_args(row: OutboxRow) -> tuple[str, dict[str, Any]]:
     return row.payload_json, {"id": row.id, "dedupe_key": row.dedup_key}
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
