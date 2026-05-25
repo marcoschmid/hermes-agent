@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  P4 followup: db_cleanup LaunchAgent. Single-shot daily 04:00.
+
+  Deletes terminal-state rows older than retention from outbox + telegram_callbacks:
+  - outbox.status='sent' >30d
+  - outbox.status='dead-lettered' RETAIN
+  - telegram_callbacks.dispatch_status='processed' >30d
+  - telegram_callbacks.dispatch_status='failed' >90d
+  - telegram_callbacks.dispatch_status='ignored' >7d
+  - telegram_callbacks.dispatch_status='dead-lettered' RETAIN
+
+  Install:
+    cp scripts/launchagents/de.marcoschmid.hermes-db-cleanup.plist \
+       ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) \
+       ~/Library/LaunchAgents/de.marcoschmid.hermes-db-cleanup.plist
+
+  Test (dry-run):
+    HERMES_DB_CLEANUP_DRY_RUN=1 \
+      scripts/db-cleanup-runner.sh
+
+  Verify:
+    tail -f ~/.openclaw/logs/db-cleanup.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>de.marcoschmid.hermes-db-cleanup</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/marco/Code/hermes-agent/scripts/db-cleanup-runner.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/marco</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>4</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/marco/.openclaw/logs/db-cleanup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/marco/.openclaw/logs/db-cleanup.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
