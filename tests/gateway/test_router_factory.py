@@ -351,6 +351,55 @@ def test_direct_sender_always_passes_dedupe_key_even_without_issue_id(tmp_path):
     assert len(cmd[dedupe_idx]) == 32  # SHA256-32 hex prefix
 
 
+def test_direct_sender_issue_target_overrides_factory_default(tmp_path):
+    """Round-2 HIGH-2: caller-supplied issue.target overrides constructor default."""
+    fake_script = tmp_path / "safe_telegram_send.sh"
+    fake_script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_script.chmod(0o755)
+
+    sender = make_direct_sender(
+        script_path=str(fake_script),
+        target_chat_id="DEFAULT-CHAT",  # factory default
+        context="default-ctx",
+    )
+
+    fake_result = subprocess.CompletedProcess(
+        args=["bash", str(fake_script)], returncode=0, stdout="", stderr="",
+    )
+    with patch("gateway.router_factory.subprocess.run", return_value=fake_result) as mock_run:
+        sender("hello", issue={"id": "x", "target": "OVERRIDE-CHAT", "context": "override-ctx"})
+
+    cmd = mock_run.call_args.args[0]
+    # Caller-supplied OVERRIDE wins over factory DEFAULT
+    target_idx = cmd.index("--target") + 1
+    assert cmd[target_idx] == "OVERRIDE-CHAT"
+    ctx_idx = cmd.index("--context") + 1
+    assert cmd[ctx_idx] == "override-ctx"
+
+
+def test_direct_sender_uses_factory_default_when_issue_missing_target(tmp_path):
+    """Round-2: backwards-compat — when issue lacks target, factory default is used."""
+    fake_script = tmp_path / "safe_telegram_send.sh"
+    fake_script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_script.chmod(0o755)
+
+    sender = make_direct_sender(
+        script_path=str(fake_script),
+        target_chat_id="DEFAULT-CHAT",
+        context="default-ctx",
+    )
+
+    fake_result = subprocess.CompletedProcess(
+        args=["bash", str(fake_script)], returncode=0, stdout="", stderr="",
+    )
+    with patch("gateway.router_factory.subprocess.run", return_value=fake_result) as mock_run:
+        sender("hello", issue={"id": "no-target"})
+
+    cmd = mock_run.call_args.args[0]
+    target_idx = cmd.index("--target") + 1
+    assert cmd[target_idx] == "DEFAULT-CHAT"
+
+
 def test_direct_sender_whitespace_id_falls_back_to_hash(tmp_path):
     fake_script = tmp_path / "safe_telegram_send.sh"
     fake_script.write_text("#!/usr/bin/env bash\nexit 0\n")

@@ -84,10 +84,20 @@ class OutboxStore:
 
     @staticmethod
     def _ensure_claim_token_column(conn: sqlite3.Connection) -> None:
-        """Idempotent migration: add claim_token to existing pre-Round-2 tables."""
+        """Idempotent migration: add claim_token to existing pre-Round-2 tables.
+
+        Round-2 (Track A2 MEDIUM-5): concurrent CLI startups could both see the
+        column missing and race the ALTER. We catch 'duplicate column' so the
+        loser of the race continues without error.
+        """
         cols = {row[1] for row in conn.execute("PRAGMA table_info(outbox)").fetchall()}
-        if "claim_token" not in cols:
+        if "claim_token" in cols:
+            return
+        try:
             conn.execute("ALTER TABLE outbox ADD COLUMN claim_token TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -154,6 +164,15 @@ class OutboxStore:
         with closing(self._conn()) as conn:
             row = conn.execute(
                 "SELECT * FROM outbox WHERE id=?", (row_id,)
+            ).fetchone()
+            return _row_to_dataclass(row) if row else None
+
+    @_retry_on_locked
+    def get_by_id_via_dedup_key(self, dedup_key: str) -> OutboxRow | None:
+        """Return row by dedup_key (idempotency check for callers/CLI)."""
+        with closing(self._conn()) as conn:
+            row = conn.execute(
+                "SELECT * FROM outbox WHERE dedup_key=?", (dedup_key,)
             ).fetchone()
             return _row_to_dataclass(row) if row else None
 

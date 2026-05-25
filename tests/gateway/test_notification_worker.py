@@ -309,6 +309,28 @@ def test_payload_to_router_args_handles_legacy_freeform_payload():
     assert issue["id"] == "row-2"
 
 
+def test_payload_to_router_args_forwards_target_and_context():
+    """Round-2 HIGH-2: target/context from outbox payload must reach issue dict
+    so direct-sender uses caller-supplied chat-id, not factory-default."""
+    from gateway.outbox import OutboxRow
+    row = OutboxRow(
+        id="row-3", channel="telegram",
+        payload_json=json.dumps({
+            "message": "hello",
+            "target": "999888777",
+            "context": "cert_expiry",
+            "title": "T",
+        }),
+        dedup_key="d-3", attempts=0, last_error=None, status="claimed",
+        next_retry_at=None, created_at="2026-05-24T12:00:00Z",
+        updated_at="2026-05-24T12:00:00Z",
+    )
+    message, issue = _payload_to_router_args(row)
+    assert issue["target"] == "999888777"
+    assert issue["context"] == "cert_expiry"
+    assert issue["title"] == "T"
+
+
 # ---- Round-2 fence tests ----------------------------------------------------
 
 

@@ -189,7 +189,10 @@ def _payload_to_router_args(row: OutboxRow) -> tuple[str, dict[str, Any]]:
             "id": str(payload.get("id") or row.id),
             "dedupe_key": row.dedup_key,
         }
-        for key in ("title", "audience", "labels", "topic", "severity"):
+        # Round-2 HIGH-2: per-call target/context must reach direct-sender.
+        # Otherwise caller --target X --context Y dispatches to factory-default.
+        for key in ("title", "audience", "labels", "topic", "severity",
+                    "target", "context"):
             if key in payload:
                 issue[key] = payload[key]
         return message, issue

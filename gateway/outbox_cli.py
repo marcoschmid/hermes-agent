@@ -42,17 +42,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--channel", required=True,
                    help="Channel slug (e.g. 'telegram', 'pushover').")
-    p.add_argument("--dedup-key", required=True,
-                   help="Dedup-key (idempotency). Convention: '${CALLER}:${SCOPE}'.")
+    # Round-2 CRITICAL-1: accept BOTH --dedup-key (new) AND --dedupe-key (legacy
+    # safe_telegram_send.sh syntax) so callers migrate mechanically.
+    p.add_argument("--dedup-key", "--dedupe-key", dest="dedup_key", required=True,
+                   help="Dedup-key (idempotency). --dedupe-key is a legacy alias.")
     p.add_argument("--message",
-                   help="Message body (UTF-8). OR use --message-stdin / --payload-json.")
+                   help="Message body (UTF-8). OR use --message-stdin / --payload-json. "
+                        "For untrusted text starting with '-' use --message='...' "
+                        "(equals-form) or --message-stdin.")
     p.add_argument("--message-stdin", action="store_true",
-                   help="Read message from stdin (for large payloads >32KB).")
+                   help="Read message from stdin (recommended for large or untrusted text).")
     p.add_argument("--target",
                    help="Channel-specific target (e.g. Telegram chat-id). "
-                        "Forwarded as payload field; Router reads from per-channel config.")
+                        "Overrides per-channel default at dispatch time.")
     p.add_argument("--context",
-                   help="Logging label / dedup-scope. Forwarded as payload field.")
+                   help="Logging label / dedup-scope. Overrides per-channel default.")
     p.add_argument("--title",
                    help="Optional title for rich-rendered notifications (Hub-Adapter).")
     p.add_argument("--audience", default="marco",
@@ -65,6 +69,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Validate args + construct payload, do NOT write to DB. Prints JSON to stdout.")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress success-JSON on stdout (errors still go to stderr).")
+    # Round-2 CRITICAL-1: accept-and-ignore legacy safe_telegram_send.sh flags so
+    # mechanical migration of bash callers succeeds without rewriting their args.
+    # These options no longer apply in async-enqueue world (Worker + Outbox handle
+    # dedupe-window via dedup_key + Hub flapping-suppression; rate-limit via Hub
+    # per-source config; buttons via channel-specific renderer).
+    p.add_argument("--dedupe-window", help=argparse.SUPPRESS)
+    p.add_argument("--rate-limit-window", help=argparse.SUPPRESS)
+    p.add_argument("--buttons", help=argparse.SUPPRESS)
+    p.add_argument("--media", help=argparse.SUPPRESS)
     return p
 
 
@@ -142,6 +155,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         store = OutboxStore(db_path=db_path)
         store.init_schema()
+        # Round-2 MEDIUM-4: detect dedupe-collision so callers see it.
+        existing_before = store.get_by_id_via_dedup_key(args.dedup_key) \
+            if hasattr(store, "get_by_id_via_dedup_key") else None
         row = store.enqueue(
             channel=args.channel,
             dedup_key=args.dedup_key,
@@ -151,8 +167,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: outbox enqueue failed: {exc}", file=sys.stderr)
         return 1
 
+    # Round-2 MEDIUM-4: deduped=true means dedup_key existed; this enqueue was a no-op
+    # (caller alert dropped — convention: prefix dedup_key with caller-name).
+    deduped = existing_before is not None
+    if deduped and not args.quiet:
+        print(f"WARN: dedup_key={args.dedup_key!r} already enqueued at "
+              f"{existing_before.created_at} (channel={existing_before.channel}); "
+              f"this call is a no-op", file=sys.stderr)
     if not args.quiet:
-        print(json.dumps({"ok": True, "row_id": row.id, "status": row.status}))
+        print(json.dumps({
+            "ok": True,
+            "row_id": row.id,
+            "status": row.status,
+            "deduped": deduped,
+        }))
     return 0
 
 
