@@ -12,9 +12,11 @@ import pytest
 from gateway.router_factory import (
     BODY_TRUNCATION_MARKER,
     DEFAULT_ALLOWED_HOSTS,
+    DEFAULT_HUB_SENDER_TIMEOUT,
     DEFAULT_HUB_URL,
     DEFAULT_MC_URL,
     NOTIFICATION_BODY_MAX_CHARS,
+    _resolve_timeout,
     make_default_router,
     make_direct_sender,
     make_hub_sender,
@@ -676,3 +678,99 @@ def test_make_default_router_hmac_mode_missing_secret_cascades_to_mc(monkeypatch
 
     assert result.ok is True
     assert result.hop == "mission-control"
+
+
+# ---- Hub-sender timeout (Option 2, 2026-05-26) -----------------------------
+# Root cause: Hub ingest is synchronous (~10 MC loopback round-trips); under host
+# load it exceeds a tight read-timeout so the worker gives up before the Hub
+# responds 200. Default bumped 10s -> 30s, tunable via HERMES_HUB_SENDER_TIMEOUT.
+
+
+def test_hub_sender_default_timeout_is_30s():
+    sender = make_hub_sender(
+        hub_url=LOOPBACK_HUB,
+        auth_mode="bearer",
+        bearer_token="tok-123",
+        source_slug="weekly-preview",
+    )
+
+    with patch("gateway.router_factory.requests.post", return_value=_hub_success()) as mock_post:
+        sender("hello", issue={"id": "wk-1"})
+
+    assert mock_post.call_args.kwargs["timeout"] == DEFAULT_HUB_SENDER_TIMEOUT == 30.0
+
+
+def test_hub_sender_explicit_timeout_overrides_default():
+    sender = make_hub_sender(
+        hub_url=LOOPBACK_HUB,
+        auth_mode="bearer",
+        bearer_token="tok-123",
+        source_slug="weekly-preview",
+        timeout_seconds=5.0,
+    )
+
+    with patch("gateway.router_factory.requests.post", return_value=_hub_success()) as mock_post:
+        sender("hello", issue={"id": "wk-1"})
+
+    assert mock_post.call_args.kwargs["timeout"] == 5.0
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, 30.0),        # unset -> default
+        ("", 30.0),          # empty -> default
+        ("   ", 30.0),       # whitespace -> default
+        ("45", 45.0),        # valid int-string
+        ("12.5", 12.5),      # valid float-string
+        ("nonsense", 30.0),  # invalid -> default
+        ("0", 30.0),         # non-positive -> default
+        ("-5", 30.0),        # negative -> default
+    ],
+)
+def test_resolve_timeout_parses_or_falls_back(raw, expected):
+    assert _resolve_timeout(raw, 30.0) == expected
+
+
+def test_default_router_reads_hub_timeout_env(monkeypatch, tmp_path):
+    """make_default_router wires HERMES_HUB_SENDER_TIMEOUT into the hub sender."""
+    run_log = tmp_path / "router-run-log.jsonl"
+    monkeypatch.setenv("HERMES_HUB_SENDER_TIMEOUT", "45")
+    monkeypatch.setenv("WEEKLY_PREVIEW_HUB_TOKEN", "hub-tok")
+
+    router = make_default_router(
+        source_slug="weekly-preview",
+        target_chat_id="128314698",
+        context="weekly-preview",
+        hub_auth_mode="bearer",
+        hub_token_env="WEEKLY_PREVIEW_HUB_TOKEN",
+        run_log_path=str(run_log),
+    )
+
+    # bearer + hub success -> cascade stops at hub; assert the hub POST timeout
+    with patch("gateway.router_factory.requests.post", return_value=_hub_success()) as mock_post:
+        result = router.send(message="m", issue={"id": "wk-1"})
+
+    assert result.ok is True
+    assert result.hop == "hermes"
+    assert mock_post.call_args.kwargs["timeout"] == 45.0
+
+
+def test_default_router_invalid_timeout_env_falls_back_to_default(monkeypatch, tmp_path):
+    run_log = tmp_path / "router-run-log.jsonl"
+    monkeypatch.setenv("HERMES_HUB_SENDER_TIMEOUT", "not-a-number")
+    monkeypatch.setenv("WEEKLY_PREVIEW_HUB_TOKEN", "hub-tok")
+
+    router = make_default_router(
+        source_slug="weekly-preview",
+        target_chat_id="128314698",
+        context="weekly-preview",
+        hub_auth_mode="bearer",
+        hub_token_env="WEEKLY_PREVIEW_HUB_TOKEN",
+        run_log_path=str(run_log),
+    )
+
+    with patch("gateway.router_factory.requests.post", return_value=_hub_success()) as mock_post:
+        router.send(message="m", issue={"id": "wk-1"})
+
+    assert mock_post.call_args.kwargs["timeout"] == DEFAULT_HUB_SENDER_TIMEOUT

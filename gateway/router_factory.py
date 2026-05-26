@@ -48,6 +48,12 @@ log = logging.getLogger(__name__)
 
 DEFAULT_HUB_URL = "http://127.0.0.1:8766"
 DEFAULT_MC_URL = "http://127.0.0.1:3334"
+# Hub ingest is synchronous and performs ~10 MC loopback round-trips per request
+# (registry + topic + rules + audit + persist). Under host load these can exceed a
+# tight read-timeout, so the worker gives up before the Hub responds 200 and the
+# cascade falls through to mission-control/direct. 30s rides that out; tune at
+# runtime via HERMES_HUB_SENDER_TIMEOUT. See project_notification_hub 2026-05-26.
+DEFAULT_HUB_SENDER_TIMEOUT = 30.0
 DEFAULT_SAFE_TELEGRAM_SCRIPT = "~/.openclaw/workspace/scripts/safe_telegram_send.sh"
 DEFAULT_RUN_LOG_PATH = "~/.openclaw/run/fallback-notification-router.jsonl"
 
@@ -133,7 +139,7 @@ def make_hub_sender(
     urgency: str = "none",
     audience: str = "marco",
     actionability: str = "info",
-    timeout_seconds: float = 10.0,
+    timeout_seconds: float = DEFAULT_HUB_SENDER_TIMEOUT,
     allowed_hosts: frozenset[str] = DEFAULT_ALLOWED_HOSTS,
 ) -> Callable[..., dict[str, Any]]:
     """Build a sender that POSTs NotificationIntent payloads to the Hermes-Hub.
@@ -325,6 +331,23 @@ def make_direct_sender(
     return sender
 
 
+def _resolve_timeout(raw: str | None, default: float) -> float:
+    """Parse a positive-float timeout from an env-var string.
+
+    Falls back to ``default`` for missing/empty/invalid/non-positive values so a
+    typo in HERMES_HUB_SENDER_TIMEOUT degrades to the safe default instead of
+    crashing the worker.
+    """
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("invalid timeout %r; using default %.1fs", raw, default)
+        return default
+    return value if value > 0 else default
+
+
 def make_default_router(
     *,
     source_slug: str,
@@ -335,6 +358,7 @@ def make_default_router(
     hub_token_env: str = "HERMES_HUB_BEARER_TOKEN",
     hub_hmac_secret_env: str = "HERMES_HUB_HMAC_SECRET",
     hub_allowed_hosts_env: str = "HERMES_HUB_ALLOWED_HOSTS",
+    hub_timeout_env: str = "HERMES_HUB_SENDER_TIMEOUT",
     mc_url_env: str = "MC_HUB_URL",
     mc_token_env: str = "MC_HUB_TOKEN",
     mc_allowed_hosts_env: str = "MC_HUB_ALLOWED_HOSTS",
@@ -365,6 +389,9 @@ def make_default_router(
         "source_slug": source_slug,
         "topic": topic,
         "allowed_hosts": hub_allowed,
+        "timeout_seconds": _resolve_timeout(
+            os.environ.get(hub_timeout_env), DEFAULT_HUB_SENDER_TIMEOUT
+        ),
     }
     if hub_auth_mode == "bearer":
         hub_sender_kwargs["bearer_token_env"] = hub_token_env
