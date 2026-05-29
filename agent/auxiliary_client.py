@@ -451,6 +451,22 @@ class _CodexCompletionsAdapter:
         self._client = real_client
         self._model = model
 
+    @staticmethod
+    def _synthesize_final_response(
+        collected_output_items: List[Any],
+        collected_text_deltas: List[str],
+        has_function_calls: bool,
+    ) -> Optional[Any]:
+        if collected_output_items:
+            return SimpleNamespace(output=list(collected_output_items))
+        if collected_text_deltas and not has_function_calls:
+            assembled = "".join(collected_text_deltas)
+            return SimpleNamespace(output=[SimpleNamespace(
+                type="message", role="assistant", status="completed",
+                content=[SimpleNamespace(type="output_text", text=assembled)],
+            )])
+        return None
+
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
@@ -538,20 +554,57 @@ class _CodexCompletionsAdapter:
             collected_output_items: List[Any] = []
             collected_text_deltas: List[str] = []
             has_function_calls = False
-            with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
-                    _etype = getattr(_event, "type", "")
-                    if _etype == "response.output_item.done":
-                        _done = getattr(_event, "item", None)
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = getattr(_event, "delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
-                final = stream.get_final_response()
+            stream_context = self._client.responses.stream(**resp_kwargs)
+            if stream_context is None:
+                raise RuntimeError("Codex auxiliary Responses stream returned None")
+            with stream_context as stream:
+                if stream is None:
+                    raise RuntimeError("Codex auxiliary Responses stream context returned None")
+                try:
+                    stream_iter = iter(stream)
+                except TypeError as exc:
+                    raise RuntimeError("Codex auxiliary Responses stream is not iterable") from exc
+                try:
+                    for _event in stream_iter:
+                        _etype = getattr(_event, "type", "")
+                        if _etype == "response.output_item.done":
+                            _done = getattr(_event, "item", None)
+                            if _done is not None:
+                                collected_output_items.append(_done)
+                        elif "output_text.delta" in _etype:
+                            _delta = getattr(_event, "delta", "")
+                            if _delta:
+                                collected_text_deltas.append(_delta)
+                        elif "function_call" in _etype:
+                            has_function_calls = True
+                except TypeError as exc:
+                    if "'NoneType' object is not iterable" not in str(exc):
+                        raise
+                    final = self._synthesize_final_response(
+                        collected_output_items,
+                        collected_text_deltas,
+                        has_function_calls,
+                    )
+                    if final is None:
+                        raise RuntimeError(
+                            "Codex auxiliary Responses stream parser failed with no recoverable output"
+                        ) from exc
+                    logger.warning(
+                        "Codex auxiliary Responses stream parser failed on nullable output; "
+                        "synthesizing final response from streamed events"
+                    )
+                else:
+                    final = stream.get_final_response()
+
+            if final is None:
+                final = self._synthesize_final_response(
+                    collected_output_items,
+                    collected_text_deltas,
+                    has_function_calls,
+                )
+                if final is None:
+                    raise RuntimeError("Codex auxiliary Responses final response was None")
+                logger.debug("Codex auxiliary: synthesized final response after empty SDK final")
 
             # Backfill empty output from collected stream events
             _output = getattr(final, "output", None)

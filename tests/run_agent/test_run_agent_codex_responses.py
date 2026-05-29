@@ -1,3 +1,4 @@
+import logging
 import sys
 import types
 from types import SimpleNamespace
@@ -483,6 +484,267 @@ def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     assert calls["create"] == 1
     assert create_stream.closed is True
     assert response.output[0].content[0].text == "streamed create ok"
+
+
+def test_run_codex_stream_none_stream_falls_back_to_create(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return None
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("create fallback after none stream")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 2, "create": 1}
+    assert response.output[0].content[0].text == "create fallback after none stream"
+
+
+def test_run_codex_stream_construction_type_error_falls_back_to_create(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        raise TypeError("'NoneType' object is not iterable")
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("create fallback after stream construction error")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 2, "create": 1}
+    assert response.output[0].content[0].text == "create fallback after stream construction error"
+
+
+def test_run_codex_stream_none_context_enter_falls_back_to_create(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    class _NoneEnterStream:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _NoneEnterStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("create fallback after none enter")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 2, "create": 1}
+    assert response.output[0].content[0].text == "create fallback after none enter"
+
+
+def test_run_codex_stream_non_iterable_stream_falls_back_to_create(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    class _NonIterableStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            return None
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _NonIterableStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("create fallback after non-iterable stream")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 2, "create": 1}
+    assert response.output[0].content[0].text == "create fallback after non-iterable stream"
+
+
+def test_run_codex_stream_iteration_type_error_falls_back_to_create(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    class _BrokenIteratorStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            raise TypeError("'NoneType' object is not iterable")
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _BrokenIteratorStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("create fallback after stream parser error")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 2, "create": 1}
+    assert response.output[0].content[0].text == "create fallback after stream parser error"
+
+
+def test_run_codex_stream_iteration_type_error_synthesizes_existing_deltas(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    class _DeltaThenBrokenStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield SimpleNamespace(type="response.output_text.delta", delta="Almost")
+            yield SimpleNamespace(type="response.output_text.delta", delta=" there")
+            raise TypeError("'NoneType' object is not iterable")
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _DeltaThenBrokenStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("should not use fallback")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 1, "create": 0}
+    assert response.output[0].content[0].text == "Almost there"
+
+
+def test_run_codex_stream_synthesizes_output_when_final_response_none(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    class _DeltaOnlyStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            return iter([
+                SimpleNamespace(type="response.output_text.delta", delta="Hello"),
+                SimpleNamespace(type="response.output_text.delta", delta=" from Hermes"),
+                SimpleNamespace(type="response.completed"),
+            ])
+
+        def get_final_response(self):
+            return None
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: _DeltaOnlyStream(),
+            create=lambda **kwargs: _codex_message_response("should not use fallback"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response.output[0].content[0].text == "Hello from Hermes"
+
+
+def test_run_conversation_local_validation_error_without_fallback_says_no_fallback(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    statuses = []
+    agent.status_callback = lambda kind, message: statuses.append(message)
+
+    def _raise_local_type_error(api_kwargs):
+        raise TypeError("'NoneType' object is not iterable")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _raise_local_type_error)
+
+    result = agent.run_conversation("Say hello")
+
+    assert result["failed"] is True
+    assert any("no fallback configured" in status for status in statuses)
+    assert not any("trying fallback" in status for status in statuses)
+
+
+def test_interruptible_codex_api_call_logs_traceback_for_worker_error(monkeypatch, caplog):
+    agent = _build_agent(monkeypatch)
+    agent._create_request_openai_client = lambda **kwargs: SimpleNamespace()
+    agent._close_request_openai_client = lambda *args, **kwargs: None
+
+    def _raise_worker_error(*args, **kwargs):
+        raise TypeError("'NoneType' object is not iterable")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", _raise_worker_error)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(TypeError):
+            agent._interruptible_api_call(_codex_request_kwargs())
+
+    records = [
+        record for record in caplog.records
+        if "Codex Responses API worker failed" in record.getMessage()
+    ]
+    assert records
+    assert records[0].exc_info
+    assert records[0].exc_info[0] is TypeError
 
 
 def test_run_conversation_codex_plain_text(monkeypatch):

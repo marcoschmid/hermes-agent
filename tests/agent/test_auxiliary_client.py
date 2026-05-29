@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -1635,6 +1636,92 @@ class TestCodexAdapterReasoningTranslation:
         )
         assert "reasoning" not in captured
 
+
+
+class TestCodexAdapterStreamingRecovery:
+    def test_nullable_output_parser_error_synthesizes_text_deltas(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        class _DeltaThenBrokenStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_text.delta", delta="Summary")
+                yield SimpleNamespace(type="response.output_text.delta", delta=" recovered")
+                raise TypeError("'NoneType' object is not iterable")
+
+            def get_final_response(self):
+                raise AssertionError("SDK final response should not be required")
+
+        real_client = MagicMock()
+        real_client.responses.stream.return_value = _DeltaThenBrokenStream()
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.3-codex")
+
+        response = adapter.create(messages=[{"role": "user", "content": "summarize"}])
+
+        assert response.choices[0].message.content == "Summary recovered"
+
+    def test_nullable_output_parser_error_synthesizes_output_item_done(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        class _ItemThenBrokenStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(
+                    type="response.output_item.done",
+                    item=SimpleNamespace(
+                        type="message",
+                        content=[SimpleNamespace(type="output_text", text="Item recovered")],
+                    ),
+                )
+                raise TypeError("'NoneType' object is not iterable")
+
+            def get_final_response(self):
+                raise AssertionError("SDK final response should not be required")
+
+        real_client = MagicMock()
+        real_client.responses.stream.return_value = _ItemThenBrokenStream()
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.3-codex")
+
+        response = adapter.create(messages=[{"role": "user", "content": "summarize"}])
+
+        assert response.choices[0].message.content == "Item recovered"
+
+    def test_final_response_none_synthesizes_text_deltas(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        class _DeltaOnlyStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter([
+                    SimpleNamespace(type="response.output_text.delta", delta="Final"),
+                    SimpleNamespace(type="response.output_text.delta", delta=" recovered"),
+                ])
+
+            def get_final_response(self):
+                return None
+
+        real_client = MagicMock()
+        real_client.responses.stream.return_value = _DeltaOnlyStream()
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.3-codex")
+
+        response = adapter.create(messages=[{"role": "user", "content": "summarize"}])
+
+        assert response.choices[0].message.content == "Final recovered"
 
 
 class TestVisionAutoSkipsKimiCoding:
