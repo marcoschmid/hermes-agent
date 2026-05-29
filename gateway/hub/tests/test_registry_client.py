@@ -247,3 +247,207 @@ async def test_get_live_event_by_fingerprint_omits_channel_when_not_passed() -> 
     await rc.get_live_event_by_fingerprint("src", "fp")
     assert "channel" not in captured["params"]
     await rc.close()
+
+
+# ---------------------------------------------------------------------------
+# Channel-isolation (5d): a revoked token (401) / server error (5xx) / network
+# failure on a registry read must raise the typed RegistryUnavailable instead
+# of letting a raw httpx.HTTPStatusError escape (which surfaced upstream as an
+# uncaught HTTP 500 → whole-hub-hop cascade on 2026-05-27). 404 / get_source-403
+# keep their "not found" → None semantics so genuine unknown-source/topic
+# answers are NOT masked as transient outages.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_source_401_raises_registry_unavailable() -> None:
+    from gateway.hub.registry_client import RegistryUnavailable
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "token revoked"})
+
+    rc = make_client(handler)
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_source("test-src")
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_source_500_raises_registry_unavailable() -> None:
+    from gateway.hub.registry_client import RegistryUnavailable
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    rc = make_client(handler)
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_source("test-src")
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_source_403_still_returns_none() -> None:
+    """Negative control: 403 is the MC 'unknown source / no match' answer and
+    must stay None, NOT become a transient RegistryUnavailable."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"error": "forbidden"})
+
+    rc = make_client(handler)
+    result = await rc.get_source("test-src")
+    assert result is None
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_topic_401_raises_registry_unavailable() -> None:
+    from gateway.hub.registry_client import RegistryUnavailable
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "token revoked"})
+
+    rc = make_client(handler)
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_topic("home.test")
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_topic_404_still_returns_none() -> None:
+    """Negative control: unknown topic stays None."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "not found"})
+
+    rc = make_client(handler)
+    result = await rc.get_topic("nope")
+    assert result is None
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_rules_503_raises_registry_unavailable() -> None:
+    from gateway.hub.registry_client import RegistryUnavailable
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    rc = make_client(handler)
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_rules(topic="home.test", audience="marco", severity="warn")
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_channel_set_502_raises_registry_unavailable() -> None:
+    from gateway.hub.registry_client import RegistryUnavailable
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, json={"error": "bad gateway"})
+
+    rc = make_client(handler)
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_channel_set_expanded("cs_1")
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_channel_set_404_still_returns_none() -> None:
+    """Negative control: unknown channel-set stays None."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "not found"})
+
+    rc = make_client(handler)
+    result = await rc.get_channel_set_expanded("missing")
+    assert result is None
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_source_connect_error_raises_registry_unavailable() -> None:
+    """A network/transport failure (MC down) must also raise RegistryUnavailable."""
+    from gateway.hub.registry_client import RegistryUnavailable
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    rc = make_client(handler)
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_source("test-src")
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_topic_403_raises_registry_unavailable() -> None:
+    """403 on a non-source endpoint is a token/permission failure (not the
+    source-scoped 'not found' that get_source uses), so it must isolate as
+    RegistryUnavailable rather than escape as a raw httpx error -> 500."""
+    from gateway.hub.registry_client import RegistryUnavailable
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"error": "forbidden"})
+
+    rc = make_client(handler)
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_topic("home.test")
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_channel_set_403_raises_registry_unavailable() -> None:
+    from gateway.hub.registry_client import RegistryUnavailable
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"error": "forbidden"})
+
+    rc = make_client(handler)
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_channel_set_expanded("cs_1")
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_get_rules_403_raises_registry_unavailable() -> None:
+    from gateway.hub.registry_client import RegistryUnavailable
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"error": "forbidden"})
+
+    rc = make_client(handler)
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_rules(topic="home.test", audience="marco", severity="warn")
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_unavailable_carries_status_code() -> None:
+    from gateway.hub.registry_client import RegistryUnavailable
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "revoked"})
+
+    rc = make_client(handler)
+    with pytest.raises(RegistryUnavailable) as exc_info:
+        await rc.get_source("test-src")
+    assert exc_info.value.status_code == 401
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_unavailable_is_not_cached() -> None:
+    """A transient failure must not poison the cache: the next call re-hits MC
+    (and would succeed once MC recovers), rather than being served a cached
+    None or a stuck error."""
+    from gateway.hub.registry_client import RegistryUnavailable
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(401, json={"error": "revoked"})
+
+    rc = make_client(handler)
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_source("test-src")
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_source("test-src")
+    assert calls["n"] == 2  # second call re-hit MC, not cached
+    await rc.close()

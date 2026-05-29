@@ -123,6 +123,29 @@ def test_hermes_down_triggers_mc_fallback(tmp_path: Path):
     assert direct.calls == []
 
 
+def test_hermes_failure_does_not_latch_across_calls(tmp_path: Path):
+    """Regression guard (5d channel-isolation): a failed hermes hop must NOT
+    latch the router into fallback for subsequent notifications.
+
+    Each send independently re-attempts the hermes hop first, so once the
+    underlying cause clears (registry recovers / token reissued) the next
+    notification goes hub-native again. The 2026-05-27 "hermes False -> direct
+    True" cascade was per-call (every read hit the revoked token), NOT a sticky
+    router state — this locks that property in.
+    """
+    router, hermes, mission_control, direct, _run_log = _make_router(
+        tmp_path, hermes_fail=True
+    )
+
+    _send(router)
+    _send(router)
+
+    # hermes hop attempted on BOTH sends — never skipped/latched after a fail.
+    assert len(hermes.calls) == 2
+    assert len(mission_control.calls) == 2  # each fell through independently
+    assert direct.calls == []
+
+
 def test_mc_down_triggers_direct_fallback(tmp_path: Path):
     router, _hermes, mission_control, direct, _run_log = _make_router(
         tmp_path, hermes_fail=True, mc_fail=True

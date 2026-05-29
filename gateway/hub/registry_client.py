@@ -18,6 +18,27 @@ DEFAULT_BASE = "http://127.0.0.1:3334"
 CACHE_TTL_SECONDS = 300
 
 
+class RegistryUnavailable(Exception):
+    """A registry read failed transiently rather than answering 'not found'.
+
+    Raised for an auth/permission failure (401/403), a server error (5xx), or
+    a transport/timeout failure — i.e. the hub could not read its config from
+    Mission Control, as opposed to MC cleanly reporting an unknown
+    source/topic/channel-set (404, or get_source 403), which the read methods
+    still return as ``None``.
+
+    Callers convert this to an HTTP 503 so one transient MC outage degrades a
+    single notification cleanly instead of escaping as an uncaught HTTP 500
+    that collapses the whole hub hop into direct-fallback (the 2026-05-27
+    cascade). It is deliberately NOT a subclass of ``PipelineError``.
+    """
+
+    def __init__(self, status_code: int | None, detail: str) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"registry_unavailable({status_code}): {detail}")
+
+
 @dataclass
 class CacheEntry:
     value: Any
@@ -54,15 +75,47 @@ class RegistryClient:
     def _cache_set(self, key: str, value: Any) -> None:
         self._cache[key] = CacheEntry(value=value, expires_at=time.time() + CACHE_TTL_SECONDS)
 
+    async def _get(
+        self,
+        path: str,
+        params: dict | None = None,
+        *,
+        none_statuses: tuple[int, ...] = (),
+    ) -> httpx.Response | None:
+        """GET a registry endpoint with transient-failure isolation.
+
+        Returns the response, or ``None`` when the status is in
+        ``none_statuses`` (a clean 'not found' answer — checked first, so an
+        endpoint that maps 403/404 to None still does). Otherwise raises
+        :class:`RegistryUnavailable` for an auth/permission failure (401/403),
+        a server error (5xx), or a transport/timeout failure, so the caller
+        surfaces a 503 instead of letting a raw ``httpx`` error escape as an
+        uncaught 500. Other 4xx (e.g. a 400 from a malformed hub request) keep
+        escaping via ``raise_for_status`` — those are hub bugs, not outages.
+        """
+        try:
+            r = await self._client.get(path, params=params or {})
+        except httpx.TransportError as exc:  # TimeoutException is a subclass
+            raise RegistryUnavailable(None, f"GET {path}: {type(exc).__name__}") from exc
+        if r.status_code in none_statuses:
+            return None
+        if r.status_code in (401, 403) or r.status_code >= 500:
+            raise RegistryUnavailable(r.status_code, f"GET {path} -> {r.status_code}")
+        r.raise_for_status()
+        return r
+
     async def get_source(self, slug: str, token_hash: str | None = None) -> dict | None:
         cache_key = f"source:{slug}:{token_hash or ''}"
         if cached := self._cache_get(cache_key):
             return cached
         params = {"token_hash": token_hash} if token_hash else {}
-        r = await self._client.get(f"/api/board/notifications/sources/{slug}", params=params)
-        if r.status_code == 404 or r.status_code == 403:
+        r = await self._get(
+            f"/api/board/notifications/sources/{slug}",
+            params=params,
+            none_statuses=(404, 403),
+        )
+        if r is None:
             return None
-        r.raise_for_status()
         data = r.json().get("data")
         if isinstance(data, dict):
             data = self._normalize_source_scope(data)
@@ -94,10 +147,11 @@ class RegistryClient:
         cache_key = f"topic:{slug}"
         if cached := self._cache_get(cache_key):
             return cached
-        r = await self._client.get(f"/api/board/notifications/topics/{slug}")
-        if r.status_code == 404:
+        r = await self._get(
+            f"/api/board/notifications/topics/{slug}", none_statuses=(404,)
+        )
+        if r is None:
             return None
-        r.raise_for_status()
         data = r.json().get("data")
         self._cache_set(cache_key, data)
         return data
@@ -123,8 +177,7 @@ class RegistryClient:
         }
         if source_id:
             params["source_id"] = source_id
-        r = await self._client.get("/api/board/notifications/rules", params=params)
-        r.raise_for_status()
+        r = await self._get("/api/board/notifications/rules", params=params)
         data = r.json().get("data", [])
         self._cache_set(cache_key, data)
         return data
@@ -133,12 +186,12 @@ class RegistryClient:
         cache_key = f"channel_set:{channel_set_id}"
         if cached := self._cache_get(cache_key):
             return cached
-        r = await self._client.get(
-            f"/api/board/notifications/channel-sets/{channel_set_id}/expanded"
+        r = await self._get(
+            f"/api/board/notifications/channel-sets/{channel_set_id}/expanded",
+            none_statuses=(404,),
         )
-        if r.status_code == 404:
+        if r is None:
             return None
-        r.raise_for_status()
         data = r.json().get("data")
         self._cache_set(cache_key, data)
         return data

@@ -21,12 +21,30 @@ from gateway.hub.hmac_sign import HmacError, verify as hmac_verify
 from gateway.hub.hub_state import HubState, connect as hub_state_connect
 from gateway.hub.nonce_store import remember_or_replay
 from gateway.hub.pipeline import PipelineError, run_pipeline
-from gateway.hub.registry_client import RegistryClient
+from gateway.hub.registry_client import RegistryClient, RegistryUnavailable
 from gateway.hub.schemas import NotificationIntent
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _registry_unavailable_exc() -> HTTPException:
+    """503 for a transient registry (Mission Control) outage.
+
+    Distinct from a 500 crash and from a 401 auth rejection: a revoked token,
+    a 5xx, or a network failure on a registry read means the hub could not
+    read its config, not that the caller is unauthorized. Surfacing it as a
+    typed 503 keeps one source's registry failure from cascading the whole
+    hub hop into direct-fallback (the 2026-05-27 regression).
+    """
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "error_code": "registry_unavailable",
+            "message": "Notification registry (Mission Control) is unavailable",
+        },
+    )
 
 
 async def _audit_auth_failed(
@@ -161,8 +179,19 @@ async def _authenticate(request: Request, body: bytes) -> str:
             detail={"error_code": "missing_source", "message": "source_slug required in body for HMAC auth"},
         )
 
-    # Fetch source.hub_secret via registry
-    source = await get_registry().get_source(source_slug)
+    # Fetch source.hub_secret via registry. A transient registry outage
+    # (revoked token / 5xx / network) must surface as 503 — NOT an uncaught
+    # 500 — and is distinct from a clean unknown-source answer (None) below.
+    try:
+        source = await get_registry().get_source(source_slug)
+    except RegistryUnavailable as exc:
+        await _audit_auth_failed(
+            "registry_unavailable",
+            "Notification registry (Mission Control) is unavailable",
+            source_slug=source_slug,
+            request=request,
+        )
+        raise _registry_unavailable_exc() from exc
     if source is None:
         await _audit_auth_failed(
             "unknown_source",
@@ -264,6 +293,8 @@ async def notifications(request: Request) -> dict:
             status_code=exc.status_code,
             detail={"error_code": exc.error_code, "message": exc.message},
         ) from exc
+    except RegistryUnavailable as exc:
+        raise _registry_unavailable_exc() from exc
 
     # v4d-A Phase 0.5: persist per-channel dispatch results to MC so the
     # fingerprint -> provider_message_id round-trip exists for edit-in-place
@@ -326,6 +357,8 @@ async def simulate(request: Request) -> dict:
                 "audit_trace": trace,
             }
         }
+    except RegistryUnavailable as exc:
+        raise _registry_unavailable_exc() from exc
 
     try:
         await validate_scope(intent, ctx, registry)
@@ -340,15 +373,18 @@ async def simulate(request: Request) -> dict:
             }
         }
 
-    rule, channel_set = await find_matching_rule(
-        registry,
-        topic=intent.topic,
-        audience_slug=ctx.audience_slug,
-        severity=intent.severity,
-        urgency=intent.urgency,
-        actionability=intent.actionability,
-        source_id=ctx.source["id"],
-    )
+    try:
+        rule, channel_set = await find_matching_rule(
+            registry,
+            topic=intent.topic,
+            audience_slug=ctx.audience_slug,
+            severity=intent.severity,
+            urgency=intent.urgency,
+            actionability=intent.actionability,
+            source_id=ctx.source["id"],
+        )
+    except RegistryUnavailable as exc:
+        raise _registry_unavailable_exc() from exc
     if rule is None or channel_set is None:
         trace.append("no_rule_match")
         return {

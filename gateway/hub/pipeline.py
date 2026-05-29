@@ -281,6 +281,12 @@ async def run_pipeline(
 
     event_id is None in Phase 1 — MC owns event-id assignment via createEvent.
     The audit-stream is keyed off (source, topic, channel) instead.
+
+    Propagates ``RegistryUnavailable`` (from the registry reads in
+    validate_and_lookup + find_matching_rule) to the caller — it is NOT a
+    PipelineError and is intentionally not caught here. The API layer converts
+    it to a 503 so a transient MC outage isolates to one notification instead
+    of cascading the whole hub hop.
     """
     # Step 1+2: Schema valid (Pydantic) + Registry-Lookup
     try:
