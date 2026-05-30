@@ -24,6 +24,7 @@ from gateway.hub.pipeline import PipelineError, run_pipeline
 from gateway.hub.registry_client import RegistryClient, RegistryUnavailable
 from gateway.hub.registry_sync import RegistrySync
 from gateway.hub.schemas import NotificationIntent
+from gateway.hub.secret_store import get_secret_store
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +205,11 @@ async def _authenticate(request: Request, body: bytes) -> str:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error_code": "unknown_source", "message": f"Source {source_slug} not registered"},
         )
-    secret = source.get("hub_secret")
+    # Step-6 secret source: prefer the inline hub_secret (mc-mode), else fall
+    # back to the local file-backed secret store (mirror-mode, where the
+    # source-dict is secret-free). The fallback is short-circuited when the
+    # inline secret is present, so the default mc-mode path is unchanged.
+    secret = source.get("hub_secret") or get_secret_store().get_hub_secret(source_slug)
     if not secret:
         await _audit_auth_failed(
             "no_hub_secret",

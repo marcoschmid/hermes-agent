@@ -39,6 +39,10 @@ agent-browser/
 *.ppk
 *.pem
 privvy*
+# Phase-6b hub_secret store (primarily lives in ~/.hermes outside the repo,
+# but ignore defensively in case HUB_REGISTRY_SECRETS_PATH points in-tree).
+registry_secrets.json
+registry_secrets.json.tmp
 images/
 __pycache__/
 hermes_agent.egg-info/
