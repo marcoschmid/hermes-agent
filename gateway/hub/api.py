@@ -438,6 +438,14 @@ def _require_pilot_token(request: Request) -> None:
     from hmac import compare_digest
 
     pilot_token = os.environ.get("HUB_PILOT_TOKEN", "")
+    if not pilot_token:
+        # No configured token → fail closed: admin endpoints stay locked rather
+        # than implicitly accepting any/empty Bearer. (Behaviour matches the
+        # `pilot_token and ...` short-circuit below; made explicit for intent.)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error_code": "missing_auth", "message": "Bearer HUB_PILOT_TOKEN required"},
+        )
     auth_header = request.headers.get("authorization", "")
     if pilot_token and auth_header.startswith("Bearer "):
         bearer = auth_header[len("Bearer "):].strip()

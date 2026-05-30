@@ -207,7 +207,7 @@ RULES = [
         "severity_min": "crit",
         "urgency_min": "none",
         "actionability_min": "info",
-        "quiet_class": "always",
+        "quiet_class": "respect",
         "channel_set_id": "cs_2",
         "escalation_policy_id": None,
         "enabled": False,
@@ -436,6 +436,62 @@ async def test_sync_once_transient_failure_leaves_prior_mirror_intact(
     finally:
         await state.close()
         await good.close()
+
+
+@pytest.mark.asyncio
+async def test_sync_once_channel_set_expanded_404_is_logged_and_counted(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A channel-set present in the LIST whose per-set expanded read 404s must
+    NOT be silently dropped: log a warning naming the set, surface it in the
+    counts (`channel_sets_skipped`), and — crucially — leave that set's prior
+    members intact (per-set replace, never a blind global wipe)."""
+    import logging
+
+    # First sync (everything OK) seeds cs_2 with its one member.
+    state = await _make_state(tmp_path, monkeypatch)
+    good = make_registry(_ok_handler())
+    try:
+        await RegistrySync(good, state).sync_once()
+        assert await _count(state, "registry_channel_set_members") == 3
+    finally:
+        await good.close()
+
+    # Second sync: cs_2's expanded route 404s (e.g. deleted mid-pull), the list
+    # still includes it. Everything else stays OK.
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/expanded") and path.split("/")[-2] == "cs_2":
+            return httpx.Response(404, json={"error": "not found"})
+        return _ok_handler()(request)
+
+    registry = make_registry(handler)
+    try:
+        registry._cache.clear()
+        with caplog.at_level(logging.WARNING):
+            result = await RegistrySync(registry, state).sync_once()
+
+        # The skipped set is reported in the counts.
+        assert result["channel_sets_skipped"] == 1
+
+        # A warning naming the skipped set id was logged.
+        assert any(
+            "cs_2" in rec.getMessage() and rec.levelno == logging.WARNING
+            for rec in caplog.records
+        )
+
+        # cs_2's prior member survives — NOT silently deleted.
+        surviving = await state.fetchone(
+            "SELECT COUNT(*) AS n FROM registry_channel_set_members "
+            "WHERE channel_set_id = ?",
+            ("cs_2",),
+        )
+        assert surviving["n"] == 1
+        # cs_1 (still fetched OK) keeps its 2 members → 3 total preserved.
+        assert await _count(state, "registry_channel_set_members") == 3
+    finally:
+        await state.close()
+        await registry.close()
 
 
 # ---------------------------------------------------------------------------

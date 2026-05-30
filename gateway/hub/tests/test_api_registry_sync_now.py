@@ -64,6 +64,31 @@ def test_admin_sync_now_rejects_wrong_token(app_client):
     assert resp.status_code == 401
 
 
+def test_admin_sync_now_with_token_unset_returns_401(app_client, monkeypatch):
+    """HUB_PILOT_TOKEN not configured at all → 401 (fail-closed), and sync is
+    never reached. Even a Bearer that looks valid cannot pass when there is no
+    configured token to compare against."""
+    monkeypatch.delenv("HUB_PILOT_TOKEN", raising=False)
+    sync_called = {"n": 0}
+
+    async def fake_sync_once():
+        sync_called["n"] += 1
+        return {}
+
+    monkeypatch.setattr(
+        hub_api,
+        "RegistrySync",
+        lambda *a, **k: AsyncMock(sync_once=AsyncMock(side_effect=fake_sync_once)),
+    )
+
+    resp = app_client.post(
+        "/v1/admin/registry-sync-now",
+        headers={"Authorization": "Bearer anything"},
+    )
+    assert resp.status_code == 401
+    assert sync_called["n"] == 0
+
+
 def test_admin_sync_now_triggers_sync(app_client, monkeypatch):
     """Valid Bearer → sync_once() runs, per-table counts returned in body."""
     counts = {

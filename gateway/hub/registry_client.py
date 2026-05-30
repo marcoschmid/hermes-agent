@@ -105,6 +105,14 @@ class RegistryClient:
         if self._owned_client:
             await self._client.aclose()
 
+    def get_http_client(self) -> httpx.AsyncClient:
+        """Expose the shared MC HTTP client (same base_url + Bearer auth).
+
+        Lets collaborators (e.g. RegistrySync's list-endpoint puller) reuse the
+        single authed client instead of reaching into the private ``_client``.
+        """
+        return self._client
+
     def _cache_get(self, key: str) -> Any | None:
         entry = self._cache.get(key)
         if not entry or entry.expires_at < time.time():
@@ -366,20 +374,38 @@ class RegistryClient:
                 None, f"mirror read failed: rules: {type(exc).__name__}"
             ) from exc
 
-        sev = _SEVERITY_ORDER[severity]
-        urg = _URGENCY_ORDER[urgency]
-        act = _ACTIONABILITY_ORDER[actionability]
+        # Caller-supplied enums must be known — an unknown value is a malformed
+        # query the mirror cannot evaluate, so surface the 503-contract carrier
+        # (like the rest of the mirror path) rather than letting a bare KeyError
+        # escape as an uncaught 500.
+        sev = _SEVERITY_ORDER.get(severity)
+        urg = _URGENCY_ORDER.get(urgency)
+        act = _ACTIONABILITY_ORDER.get(actionability)
+        if sev is None or urg is None or act is None:
+            raise RegistryUnavailable(
+                None,
+                "unknown severity/urgency/actionability: "
+                f"{severity!r}/{urgency!r}/{actionability!r}",
+            )
 
         result: list[dict] = []
         for raw in rows:
             r = dict(raw)
             if not _topic_matches(r["topic_glob"], topic):
                 continue
-            if sev < _SEVERITY_ORDER[r["severity_min"]]:
+            # Row enums come from the mirror DB (corrupt/future-MC values are
+            # possible). Skip a row with an unknown threshold instead of
+            # crashing the whole lookup with a KeyError → 500.
+            row_sev = _SEVERITY_ORDER.get(r["severity_min"])
+            row_urg = _URGENCY_ORDER.get(r["urgency_min"])
+            row_act = _ACTIONABILITY_ORDER.get(r["actionability_min"])
+            if row_sev is None or row_urg is None or row_act is None:
                 continue
-            if urg < _URGENCY_ORDER[r["urgency_min"]]:
+            if sev < row_sev:
                 continue
-            if act < _ACTIONABILITY_ORDER[r["actionability_min"]]:
+            if urg < row_urg:
+                continue
+            if act < row_act:
                 continue
             if r["source_id"] is not None and r["source_id"] != source_id:
                 continue

@@ -381,6 +381,58 @@ async def test_mirror_get_rules_empty_returns_empty_list_not_none(mirror_state, 
     assert result is not None
 
 
+@pytest.mark.asyncio
+async def test_mirror_get_rules_unknown_row_enum_skipped_not_500(mirror_state, monkeypatch):
+    """A mirror rule carrying an unknown severity_min (corrupt/future-MC value)
+    must be SKIPPED defensively, not crash the lookup with an uncaught KeyError
+    → 500. A good rule alongside it still matches."""
+    await _seed_audience(mirror_state, "aud_marco", "marco")
+    # Bad row: severity_min is not in _SEVERITY_ORDER → would KeyError on lookup.
+    await _seed_rule(
+        mirror_state, id="r_bad", slug="r-bad", priority=2, topic_glob=None,
+        severity_min="ZZZ_UNKNOWN", channel_set_id="cs_bad",
+    )
+    # Good row alongside it: must still be returned.
+    await _seed_rule(
+        mirror_state, id="r_good", slug="r-good", priority=5, topic_glob=None,
+        severity_min="info", channel_set_id="cs_good",
+    )
+    rc = mirror_client(mirror_state, monkeypatch)
+
+    rules = await rc.get_rules(topic="home.ev_charge", audience="marco", severity="info")
+    # Bad row skipped (continue), good row survives — no 500/KeyError.
+    assert [r["id"] for r in rules] == ["r_good"]
+
+
+@pytest.mark.asyncio
+async def test_mirror_get_rules_unknown_caller_enum_raises_registry_unavailable(
+    mirror_state, monkeypatch
+):
+    """An unknown caller-supplied severity/urgency/actionability must raise the
+    typed RegistryUnavailable (→ 503-contract), NOT an uncaught KeyError → 500."""
+    await _seed_audience(mirror_state, "aud_marco", "marco")
+    await _seed_rule(
+        mirror_state, id="r_global", slug="r-global", priority=5, topic_glob=None,
+        severity_min="info", channel_set_id="cs_g",
+    )
+    rc = mirror_client(mirror_state, monkeypatch)
+
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_rules(
+            topic="home.ev_charge", audience="marco", severity="ZZZ_UNKNOWN",
+        )
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_rules(
+            topic="home.ev_charge", audience="marco", severity="info",
+            urgency="ZZZ_UNKNOWN",
+        )
+    with pytest.raises(RegistryUnavailable):
+        await rc.get_rules(
+            topic="home.ev_charge", audience="marco", severity="info",
+            actionability="ZZZ_UNKNOWN",
+        )
+
+
 # ---------------------------------------------------------------------------
 # get_channel_set_expanded — nested-members shape parity.
 # ---------------------------------------------------------------------------

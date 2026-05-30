@@ -101,7 +101,7 @@ class RegistrySync:
         revoked token / 5xx / network error → RegistryUnavailable (the
         503-contract carrier); a clean 200 returns the envelope ``data`` array.
         """
-        client = self._registry._client
+        client = self._registry.get_http_client()
         try:
             resp = await client.get(path)
         except httpx.TransportError as exc:  # TimeoutException is a subclass
@@ -133,7 +133,12 @@ class RegistrySync:
 
         # channel-set MEMBERS are not in the list payload → pull per set via
         # the existing expanded route (also RegistryUnavailable-isolating).
+        # A set listed but whose expanded read 404s (e.g. deleted mid-pull) is
+        # NOT silently dropped: warn, collect its id, and surface it in the
+        # counts. _replace_members only touches sets actually re-fetched, so the
+        # skipped set keeps its prior members instead of being wiped.
         expanded: dict[str, dict] = {}
+        skipped_set_ids: list[str] = []
         for cs in channel_sets:
             cs_id = cs.get("id")
             if not cs_id:
@@ -141,6 +146,13 @@ class RegistrySync:
             exp = await self._registry.get_channel_set_expanded(cs_id)
             if exp is not None:
                 expanded[cs_id] = exp
+            else:
+                skipped_set_ids.append(cs_id)
+                logger.warning(
+                    "registry sync: channel-set %s listed but expanded read "
+                    "returned no data (404) — keeping prior members",
+                    cs_id,
+                )
 
         now = int(time.time())
 
@@ -174,6 +186,7 @@ class RegistrySync:
             "channels": len(channels),
             "channel_sets": len(channel_sets),
             "channel_set_members": member_count,
+            "channel_sets_skipped": len(skipped_set_ids),
             "rules": len(rules),
         }
 

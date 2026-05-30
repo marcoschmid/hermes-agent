@@ -65,10 +65,31 @@ def _load_existing(path: Path) -> dict[str, str]:
 
 
 def _write_secure(path: Path, mapping: dict[str, str]) -> None:
-    """Write the JSON file atomically-ish with 0o600 perms (never logs values)."""
+    """Write the JSON file atomically-ish with 0o600 perms (never logs values).
+
+    The temp file is created via ``os.open(..., O_CREAT|O_EXCL, 0o600)`` so it
+    exists at 0o600 from the first byte — closing the umask window where a
+    ``write_text``-then-``chmod`` sequence would briefly expose secrets at the
+    default (umask-derived) mode.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(mapping, indent=2, sort_keys=True), encoding="utf-8")
+    # O_EXCL refuses a pre-existing tmp; clear a stale one from a crashed run.
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    payload = json.dumps(mapping, indent=2, sort_keys=True)
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, _FILE_MODE)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+    except BaseException:
+        # Don't leave a half-written secret tmp behind on failure.
+        tmp.unlink(missing_ok=True)
+        raise
+    # Belt-and-suspenders: a non-zero umask cannot widen O_CREAT mode, but an
+    # inherited stricter mode is fine; force the canonical 0o600 either way.
     os.chmod(tmp, _FILE_MODE)
     os.replace(tmp, path)
     os.chmod(path, _FILE_MODE)
