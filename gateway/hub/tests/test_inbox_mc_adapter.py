@@ -41,6 +41,32 @@ async def send_with_transport(handler, monkeypatch, event: dict | None = None) -
 
 
 @pytest.mark.asyncio
+async def test_severed_raises_without_mc_post(monkeypatch) -> None:
+    """Phase-6b Step-7: severed → inbox_mc makes NO MC POST and fails loudly.
+
+    inbox_mc is retired at apply-time (channel-set members removed); the code
+    guard is the defensive belt so a stray dispatch can never write to MC after
+    the key is revoked. Honest failure beats a fake 'delivered'.
+    """
+    monkeypatch.setenv("HUB_MC_WRITE_SEVERED", "1")
+    monkeypatch.setenv("MC_HUB_BASE_URL", "http://mc.test")
+    monkeypatch.setenv("MC_HUB_TOKEN", "test-token")
+    monkeypatch.setenv("MC_HUB_ALLOW_HOSTS", "mc.test")
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(201, json={"data": {"event_id": "x"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://mc.test") as client:
+        adapter = InboxMcAdapter(client=client)
+        with pytest.raises(AdapterDeliveryError):
+            await adapter.send(make_event(), {"type": "inbox_mc"})
+    assert calls["n"] == 0
+
+
+@pytest.mark.asyncio
 async def test_success(monkeypatch) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"
