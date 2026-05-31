@@ -39,6 +39,7 @@ import os
 import re
 import socket
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -156,20 +157,29 @@ def _read_json(path: Path) -> dict | None:
 
 
 def _write_json(path: Path, data: dict) -> None:
-    """Write a dict as JSON with restricted permissions (0o600)."""
+    """Write a dict as JSON with restricted permissions (0o600), atomically.
+
+    Uses a UNIQUE per-write temp file via mkstemp + os.replace. A fixed-name
+    shared temp (``path.with_suffix('.tmp')``) plus pre-unlink is self-defeating
+    under concurrent writers for the same token path: one writer can unlink
+    another's in-flight temp (FileNotFoundError) or collide on O_EXCL. mkstemp
+    gives each writer its own temp; os.replace then swaps it in atomically.
+    The fd is created 0o600 by mkstemp; fchmod is explicit for clarity.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    fd, tmp_str = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
     try:
-        # Create with 0o600 atomically (O_CREAT|O_EXCL|0o600) so the token
-        # file is never transiently world/group readable between write and
-        # chmod. Drop any stale temp first so the fresh create owns the mode.
-        tmp.unlink(missing_ok=True)
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(data, indent=2, default=str))
-        tmp.rename(path)
-    except OSError:
-        tmp.unlink(missing_ok=True)
+        os.replace(tmp_str, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_str)
+        except OSError:
+            pass
         raise
 
 

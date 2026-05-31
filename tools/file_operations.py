@@ -37,6 +37,7 @@ from tools.binary_extensions import BINARY_EXTENSIONS
 from agent.file_safety import (
     build_write_denied_paths,
     build_write_denied_prefixes,
+    get_read_block_error as _shared_get_read_block_error,
     get_safe_write_root as _shared_get_safe_write_root,
     is_write_denied as _shared_is_write_denied,
 )
@@ -633,6 +634,13 @@ class ShellFileOperations(FileOperations):
         Uses cat so the full file is returned regardless of size.
         """
         path = self._expand_path(path)
+        # Secret-store read guard — closes every read_file_raw caller at once
+        # (V4A patch validation, _apply_update/_apply_delete, MOVE source). The
+        # agent runs as the owner of HERMES_HOME, so OS perms don't protect its
+        # own auth.json / .env / mcp-tokens; refuse before any shell exec.
+        _blk = _shared_get_read_block_error(path)
+        if _blk:
+            return ReadResult(error=_blk)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
         stat_result = self._exec(stat_cmd)
         if stat_result.exit_code != 0:

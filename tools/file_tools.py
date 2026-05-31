@@ -8,7 +8,7 @@ import os
 import threading
 from pathlib import Path
 
-from agent.file_safety import get_read_block_error
+from agent.file_safety import get_read_block_error, is_write_denied
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations,
@@ -474,8 +474,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             })
 
         # ── Hermes internal path guard ────────────────────────────────
-        # Prevent prompt injection via catalog or hub metadata files.
-        block_error = get_read_block_error(path)
+        # Prevent prompt injection via catalog or hub metadata files, and
+        # block secret-store reads.  Guard the TASK-RESOLVED path (not the raw
+        # caller string): a relative read is resolved against the terminal cwd,
+        # so checking the unresolved string lets read_file("auth.json") slip
+        # past when the terminal cwd is HERMES_HOME.
+        block_error = get_read_block_error(str(_resolved))
         if block_error:
             return json.dumps({"error": block_error})
 
@@ -856,10 +860,26 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         import re as _re
         for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
             _paths_to_check.append(_m.group(1).strip())
+        # ``Move File`` has both a source and a destination — guard both, and
+        # close the original regex gap that never recognized Move at all.
+        for _m in _re.finditer(r'^\*\*\*\s+Move\s+File:\s*(.+?)\s*->\s*(.+)$', patch, _re.MULTILINE):
+            _paths_to_check.append(_m.group(1).strip())
+            _paths_to_check.append(_m.group(2).strip())
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
+        # Secret stores must not be read (V4A validation reads the target via
+        # read_file_raw BEFORE any write-deny) or written via the patch path.
+        # Resolve against the task cwd so a relative path can't dodge the guard.
+        try:
+            _resolved_p = str(_resolve_path_for_task(_p, task_id))
+        except (OSError, ValueError):
+            _resolved_p = _p
+        if get_read_block_error(_resolved_p) or is_write_denied(_resolved_p):
+            return tool_error(
+                f"Refusing to patch sensitive Hermes secret store: {_p}"
+            )
     try:
         # Resolve paths for locking.  Ordered + deduplicated so concurrent
         # callers lock in the same order — prevents deadlock on overlapping
@@ -982,11 +1002,41 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "already_searched": count,
             }, ensure_ascii=False)
 
+        # ── Secret-store read guard ───────────────────────────────────
+        # search_files is a content-reading tool: an explicit secret-file path
+        # (auth.json / .env / mcp-tokens / /proc/*/environ) must be refused,
+        # mirroring read_file.  Redaction below is best-effort and off by
+        # default — it is NOT a security boundary.
+        block_error = get_read_block_error(path)
+        if block_error:
+            return json.dumps({"error": block_error}, ensure_ascii=False)
+
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
             pattern=pattern, path=path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
+
+        # Drop any returned match/file that resolves to a secret store — a
+        # directory recursion can surface a non-hidden secret (e.g. auth.json
+        # or mcp-tokens/*.json) that rg/grep do not exclude.  Match paths are
+        # relative to the search root when not absolute.
+        def _is_secret_match_path(mp: str) -> bool:
+            if not mp:
+                return False
+            p = Path(mp)
+            if not p.is_absolute():
+                p = Path(path) / mp
+            return get_read_block_error(str(p)) is not None
+
+        if getattr(result, 'matches', None):
+            result.matches = [
+                m for m in result.matches
+                if not _is_secret_match_path(getattr(m, 'path', ''))
+            ]
+        if getattr(result, 'files', None):
+            result.files = [f for f in result.files if not _is_secret_match_path(f)]
+
         if hasattr(result, 'matches'):
             for m in result.matches:
                 if hasattr(m, 'content') and m.content:
