@@ -458,3 +458,115 @@ async def test_fingerprint_dispatch_still_leaks_one_mc_read_today(
     # (source/topic/rules/channel-set all resolved from the mirror — no GET.)
     assert len(spy.get_requests) == 1, spy.get_requests
     assert "/api/board/notifications/events/by-fingerprint" in spy.get_requests[0]
+
+
+# ===========================================================================
+# STEP-7 ZERO-MC-WRITE PROOF: with HUB_MC_WRITE_SEVERED=1 (+ mirror reads), a
+# full dispatch makes ZERO MC HTTP calls — neither GET nor POST. This is the
+# teeth-verified gate for revoking api_keys id=60: the hub is provably
+# MC-independent for both reads AND writes on the dispatch path.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_severed_dispatch_makes_zero_mc_calls(
+    mirror_db, secret_file, reset_singletons, monkeypatch
+):
+    """mirror + severed → a signed FIRING dispatch delivers with NOT ONE MC
+    call. The write sinks (post_audit, persist_deliveries) no-op under
+    severance; reads come from the mirror. spy records zero GET and zero POST."""
+    monkeypatch.setenv("HUB_REGISTRY_SOURCE", "mirror")
+    monkeypatch.setenv("HUB_MC_WRITE_SEVERED", "1")
+    monkeypatch.delenv("HUB_PILOT_TOKEN", raising=False)
+
+    spy = McReadSpy()
+    mc_client = httpx.AsyncClient(
+        base_url="http://mc-must-not-be-touched.invalid",
+        transport=httpx.MockTransport(spy.handler),
+    )
+    registry = RegistryClient(client=mc_client, state=mirror_db)
+    hub_api.set_registry(registry)
+    hub_api.set_hub_state(mirror_db)
+
+    from gateway.hub import pipeline as pipeline_mod
+
+    original_get_adapter = pipeline_mod.get_adapter
+
+    def fake_get_adapter(channel_type: str):
+        if channel_type == "inbox_mc":
+            return FakeInboxMcAdapter()
+        return original_get_adapter(channel_type)
+
+    monkeypatch.setattr("gateway.hub.pipeline.get_adapter", fake_get_adapter)
+
+    body = json.dumps(BASIC_INTENT).encode()
+    headers = _hmac_headers(TEST_SECRET, body, nonce="zero-write-nonce-1")
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    resp = client.post("/v1/notifications", content=body, headers=headers)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["status"] == "delivered"
+
+    # THE ZERO-MC-WRITE PROOF: not a single MC call escaped — read OR write.
+    assert spy.get_requests == [], f"READ LEAK under severance: {spy.get_requests}"
+    assert spy.post_requests == [], f"WRITE LEAK under severance: {spy.post_requests}"
+
+    # Durable proof-of-dispatch: local hub_events_log still written.
+    row = await mirror_db.fetchone(
+        "SELECT status FROM hub_events_log WHERE source_slug = ? AND topic_slug = ?",
+        (SOURCE_SLUG, TOPIC_SLUG),
+    )
+    assert row is not None and row["status"] == "delivered_inbox"
+
+
+@pytest.mark.asyncio
+async def test_severance_closes_the_fingerprint_read_leak(
+    mirror_db, secret_file, reset_singletons, monkeypatch
+):
+    """The one pinned read leak (get_live_event_by_fingerprint) is CLOSED by
+    severance: a fingerprint-bearing dispatch under HUB_MC_WRITE_SEVERED=1 emits
+    ZERO MC GET (vs exactly 1 without severance — see the pin test above)."""
+    monkeypatch.setenv("HUB_REGISTRY_SOURCE", "mirror")
+    monkeypatch.setenv("HUB_MC_WRITE_SEVERED", "1")
+    monkeypatch.delenv("HUB_PILOT_TOKEN", raising=False)
+
+    spy = McReadSpy()
+    mc_client = httpx.AsyncClient(
+        base_url="http://mc-must-not-be-touched.invalid",
+        transport=httpx.MockTransport(spy.handler),
+    )
+    registry = RegistryClient(client=mc_client, state=mirror_db)
+    hub_api.set_registry(registry)
+    hub_api.set_hub_state(mirror_db)
+
+    from gateway.hub import pipeline as pipeline_mod
+
+    original_get_adapter = pipeline_mod.get_adapter
+
+    def fake_get_adapter(channel_type: str):
+        if channel_type == "inbox_mc":
+            return FakeInboxMcAdapter()
+        return original_get_adapter(channel_type)
+
+    monkeypatch.setattr("gateway.hub.pipeline.get_adapter", fake_get_adapter)
+
+    intent = dict(BASIC_INTENT, fingerprint="fp-edit-in-place-1")
+    body = json.dumps(intent).encode()
+    headers = _hmac_headers(TEST_SECRET, body, nonce="severed-fp-nonce-1")
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    resp = client.post("/v1/notifications", content=body, headers=headers)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["status"] == "delivered"
+
+    # Leak closed: the by-fingerprint GET is skipped under severance.
+    assert spy.get_requests == [], f"fingerprint read leaked under severance: {spy.get_requests}"
+    assert spy.post_requests == [], f"write leaked under severance: {spy.post_requests}"
