@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 import httpx
 
+from gateway.hub.severance import mc_writes_severed
+
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import cycle
     from gateway.hub.hub_state import HubState
 
@@ -482,6 +484,10 @@ class RegistryClient:
         }
 
     async def post_audit(self, **kwargs) -> None:
+        # Phase-6b Step-7: severed → drop the MC audit POST. hub_events_log is
+        # already the local audit SoT; the MC mirror is allowed to go stale.
+        if mc_writes_severed():
+            return
         r = await self._client.post("/api/board/notifications/audit", json=kwargs)
         r.raise_for_status()
 
@@ -502,6 +508,11 @@ class RegistryClient:
         fails → fallback to send instead of edit. Pipeline always passes the
         dispatch channel's id so the returned row matches.
         """
+        # Phase-6b Step-7: severed → skip the MC GET. This is the one remaining
+        # dispatch-path MC read (write-adjacent, edit-in-place lookup); 0 prod
+        # callers set fingerprint, so returning None just routes to send.
+        if mc_writes_severed():
+            return None
         params: dict[str, str] = {"source": source_slug, "fingerprint": fingerprint}
         if channel_id:
             params["channel"] = channel_id
@@ -535,6 +546,10 @@ class RegistryClient:
         failure must not break the Hub-response to senders. MC normalises
         "edited" -> "delivered" server-side for the CHECK constraint.
         """
+        # Phase-6b Step-7: severed → drop the MC delivery persist (send-only, 0
+        # prod callers depend on the round-trip; best-effort already).
+        if mc_writes_severed():
+            return
         try:
             resp = await self._client.post(
                 f"{self.base_url}/api/board/notifications/events/{event_id}/deliveries",

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import httpx
 from gateway.hub.registry_client import RegistryClient
+from gateway.hub.severance import ENV_WRITE_SEVERED
 
 
 def make_client(handler) -> RegistryClient:
@@ -92,6 +93,56 @@ async def test_post_audit() -> None:
     rc = make_client(handler)
     await rc.post_audit(event_id="evt_1", actor="hermes-dispatcher", action="rule_matched")
     assert captured["body"]["actor"] == "hermes-dispatcher"
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_post_audit_no_mc_call_when_severed(monkeypatch) -> None:
+    """Step-7: severed → post_audit makes NO MC POST and returns None."""
+    monkeypatch.setenv(ENV_WRITE_SEVERED, "1")
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(201, json={"data": {}})
+
+    rc = make_client(handler)
+    result = await rc.post_audit(event_id="evt_1", actor="hermes", action="rule_matched")
+    assert calls["n"] == 0
+    assert result is None
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_persist_deliveries_no_mc_call_when_severed(monkeypatch) -> None:
+    """Step-7: severed → persist_deliveries makes NO MC POST (best-effort no-op)."""
+    monkeypatch.setenv(ENV_WRITE_SEVERED, "1")
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"ok": True})
+
+    rc = make_client(handler)
+    await rc.persist_deliveries(event_id="evt_1", deliveries=[{"channel_id": "ch_x"}])
+    assert calls["n"] == 0
+    await rc.close()
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_lookup_no_mc_call_when_severed(monkeypatch) -> None:
+    """Step-7: severed → fingerprint read makes NO MC GET and returns None."""
+    monkeypatch.setenv(ENV_WRITE_SEVERED, "1")
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"event": {"id": "evt_1"}})
+
+    rc = make_client(handler)
+    result = await rc.get_live_event_by_fingerprint("src", "fp-123", channel_id="ch_x")
+    assert calls["n"] == 0
+    assert result is None
     await rc.close()
 
 
