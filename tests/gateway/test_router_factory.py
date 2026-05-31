@@ -242,6 +242,23 @@ def test_mc_sender_201_response_treated_as_ok():
     assert call_url == f"{LOOPBACK_MC}/api/board/notifications/events"
 
 
+def test_mc_sender_severed_skips_post(monkeypatch):
+    """Phase-6b Step-7: severed → no MC POST; returns ok:False so the fallback
+    cascade advances to the direct telegram sender."""
+    monkeypatch.setenv("HUB_MC_WRITE_SEVERED", "1")
+    sender = make_mc_sender(
+        mc_url=LOOPBACK_MC,
+        bearer_token="mc-tok",
+        source_slug="weekly-preview",
+    )
+
+    with patch("gateway.router_factory.requests.post") as mock_post:
+        result = sender("hello", issue={"id": "wk-2026-22", "title": "Wochenvorschau"})
+
+    assert mock_post.call_count == 0
+    assert result["ok"] is False
+
+
 def test_mc_sender_missing_token_returns_not_ok():
     sender = make_mc_sender(
         mc_url=LOOPBACK_MC,
