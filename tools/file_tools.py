@@ -1020,6 +1020,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         # search from a HERMES_HOME terminal cwd can't dodge it.  Redaction
         # below is best-effort and off by default — NOT a security boundary.
         _resolved_root = _resolve_path_for_task(path, task_id)
+        _live_cwd = _resolve_path_for_task(".", task_id)
         block_error = get_read_block_error(str(_resolved_root))
         if block_error:
             return json.dumps({"error": block_error}, ensure_ascii=False)
@@ -1032,17 +1033,21 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 
         # Drop any returned match/file/count that resolves to a secret store —
         # a directory recursion surfaces non-hidden secrets (auth.json,
-        # mcp-tokens/*.json) that rg/grep do not exclude.  Relative result
-        # paths are resolved against the TASK-RESOLVED search root (not the
-        # process cwd).  counts/total_count are filtered too, else count mode
-        # is a blind regex oracle over secret files.
+        # mcp-tokens/*.json) that rg/grep do not exclude.  counts/total_count
+        # are filtered too, else count mode is a blind regex oracle over secret
+        # files.  A relative result path may be emitted relative to the search
+        # ROOT or to the command CWD (e.g. path='..' yields '../auth.json'
+        # relative to cwd), so test BOTH bases and block if EITHER hits.
         def _is_secret_match_path(mp: str) -> bool:
             if not mp:
                 return False
             p = Path(mp)
-            if not p.is_absolute():
-                p = _resolved_root / mp
-            return get_read_block_error(str(p)) is not None
+            if p.is_absolute():
+                return get_read_block_error(str(p)) is not None
+            return any(
+                get_read_block_error(str(base / mp)) is not None
+                for base in (_resolved_root, _live_cwd)
+            )
 
         _filtered = False
         if getattr(result, 'matches', None):
