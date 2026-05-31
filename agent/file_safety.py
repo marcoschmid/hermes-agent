@@ -27,6 +27,7 @@ def build_write_denied_paths(home: str) -> set[str]:
             os.path.join(home, ".ssh", "id_ed25519"),
             os.path.join(home, ".ssh", "config"),
             str(hermes_home / ".env"),
+            str(hermes_home / "auth.json"),
             os.path.join(home, ".bashrc"),
             os.path.join(home, ".zshrc"),
             os.path.join(home, ".profile"),
@@ -45,9 +46,11 @@ def build_write_denied_paths(home: str) -> set[str]:
 
 def build_write_denied_prefixes(home: str) -> list[str]:
     """Return sensitive directory prefixes that must never be written."""
+    hermes_home = _hermes_home_path()
     return [
         os.path.realpath(p) + os.sep
         for p in [
+            str(hermes_home / "mcp-tokens"),
             os.path.join(home, ".ssh"),
             os.path.join(home, ".aws"),
             os.path.join(home, ".gnupg"),
@@ -91,9 +94,37 @@ def is_write_denied(path: str) -> bool:
 
 
 def get_read_block_error(path: str) -> Optional[str]:
-    """Return an error message when a read targets internal Hermes cache files."""
+    """Return an error message when a read targets internal Hermes cache files
+    or sensitive secret stores."""
     resolved = Path(path).expanduser().resolve()
     hermes_home = _hermes_home_path().resolve()
+
+    # ── Secret-store guard ────────────────────────────────────────────
+    # The agent process runs as the owner of HERMES_HOME, so OS permissions
+    # do not protect these files from the agent's own file-read tool. Block
+    # them at the application layer to prevent token/secret exfiltration.
+    secret_files = {hermes_home / "auth.json", hermes_home / ".env"}
+    secret_dirs = [hermes_home / "mcp-tokens"]
+    is_secret = resolved in secret_files
+    if not is_secret:
+        for sd in secret_dirs:
+            try:
+                resolved.relative_to(sd)
+                is_secret = True
+                break
+            except ValueError:
+                continue
+    # /proc/.../environ leaks the process environment (provider keys). Covers
+    # /proc/<pid>/environ, /proc/self/environ, /proc/<pid>/task/<tid>/environ.
+    if not is_secret and str(resolved).startswith("/proc/") and resolved.name == "environ":
+        is_secret = True
+    if is_secret:
+        return (
+            f"Access denied: {path} is a sensitive Hermes secret store "
+            "and cannot be read directly. Use the appropriate Hermes tool "
+            "if you need credential-backed functionality."
+        )
+
     blocked_dirs = [
         hermes_home / "skills" / ".hub" / "index-cache",
         hermes_home / "skills" / ".hub",

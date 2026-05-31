@@ -160,8 +160,13 @@ def _write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     try:
-        tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-        os.chmod(tmp, 0o600)
+        # Create with 0o600 atomically (O_CREAT|O_EXCL|0o600) so the token
+        # file is never transiently world/group readable between write and
+        # chmod. Drop any stale temp first so the fresh create owns the mode.
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=2, default=str))
         tmp.rename(path)
     except OSError:
         tmp.unlink(missing_ok=True)

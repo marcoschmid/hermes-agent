@@ -93,6 +93,20 @@ class TestConfigPassthrough:
 
         assert not is_env_passthrough("ANYTHING")
 
+    def test_provider_credential_in_config_is_filtered(self, tmp_path, monkeypatch):
+        # GHSA-rhgp-j443-p4rf: Hermes-managed provider credentials must not
+        # pass through to sandboxes even via the user config.yaml path. The
+        # skill-registration path already filters these; the config path did
+        # not, leaving a bypass.
+        config = {"terminal": {"env_passthrough": ["ANTHROPIC_API_KEY", "SAFE_CUSTOM_KEY"]}}
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump(config))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _ep_mod._config_passthrough = None
+
+        assert not is_env_passthrough("ANTHROPIC_API_KEY")
+        assert is_env_passthrough("SAFE_CUSTOM_KEY")
+
     def test_union_of_skill_and_config(self, tmp_path, monkeypatch):
         config = {"terminal": {"env_passthrough": ["CONFIG_KEY"]}}
         config_path = tmp_path / "config.yaml"

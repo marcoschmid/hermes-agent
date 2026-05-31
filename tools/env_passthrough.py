@@ -114,7 +114,20 @@ def _load_config_passthrough() -> frozenset[str]:
         if isinstance(passthrough, list):
             for item in passthrough:
                 if isinstance(item, str) and item.strip():
-                    result.add(item.strip())
+                    name = item.strip()
+                    if _is_hermes_provider_credential(name):
+                        # GHSA-rhgp-j443-p4rf: never pass Hermes-managed
+                        # provider credentials through to sandboxes, even
+                        # when listed in the user's config.yaml.
+                        logger.warning(
+                            "env passthrough: ignoring Hermes provider "
+                            "credential %s from config.yaml; provider "
+                            "credentials are never passed to sandboxes "
+                            "(see GHSA-rhgp-j443-p4rf).",
+                            name,
+                        )
+                        continue
+                    result.add(name)
     except Exception as e:
         logger.debug("Could not read tools.env_passthrough from config: %s", e)
 
