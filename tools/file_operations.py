@@ -638,7 +638,13 @@ class ShellFileOperations(FileOperations):
         # (V4A patch validation, _apply_update/_apply_delete, MOVE source). The
         # agent runs as the owner of HERMES_HOME, so OS perms don't protect its
         # own auth.json / .env / mcp-tokens; refuse before any shell exec.
-        _blk = _shared_get_read_block_error(path)
+        # Resolve relative paths against the LIVE terminal cwd (the cwd the cat
+        # below runs in) so a cwd of HERMES_HOME can't dodge the guard.
+        _guard_path = path
+        if not os.path.isabs(_guard_path):
+            _base = getattr(self.env, "cwd", None) or self.cwd or "/"
+            _guard_path = os.path.join(_base, _guard_path)
+        _blk = _shared_get_read_block_error(_guard_path)
         if _blk:
             return ReadResult(error=_blk)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"

@@ -147,6 +147,37 @@ class TestPatchEntryBlocksSecrets:
         fake.patch_v4a.assert_not_called()
 
     @patch("tools.file_tools._get_file_ops")
+    def test_v4a_update_no_space_marker_blocked(self, mock_ops):
+        # The parser accepts `***Update File:` (zero whitespace after ***);
+        # the entry guard must too, or the secret slips past.
+        fake = _fake_patch_ops()
+        mock_ops.return_value = fake
+        env = get_hermes_home() / ".env"
+        patch_str = (
+            "*** Begin Patch\n"
+            f"***Update File: {env}\n"
+            "@@\n-a\n+b\n"
+            "*** End Patch"
+        )
+        result = json.loads(patch_tool(mode="patch", patch=patch_str, task_id="f2_nospace"))
+        assert "error" in result
+        fake.patch_v4a.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_v4a_move_no_space_marker_blocked(self, mock_ops):
+        fake = _fake_patch_ops()
+        mock_ops.return_value = fake
+        auth = get_hermes_home() / "auth.json"
+        patch_str = (
+            "*** Begin Patch\n"
+            f"***Move File: {auth} -> /tmp/exfil.json\n"
+            "*** End Patch"
+        )
+        result = json.loads(patch_tool(mode="patch", patch=patch_str, task_id="f2_movenospace"))
+        assert "error" in result
+        fake.patch_v4a.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
     def test_v4a_normal_update_still_works(self, mock_ops):
         fake = _fake_patch_ops()
         mock_ops.return_value = fake
