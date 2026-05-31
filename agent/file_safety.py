@@ -38,9 +38,10 @@ def hermes_secret_store_dirs() -> list[Path]:
     """HERMES_HOME credential-store directories — any file within is protected."""
     h = _hermes_home_path()
     return [
-        h / "mcp-tokens",   # per-server MCP OAuth tokens
-        h / "auth",         # google_oauth.json (+ .lock)
-        h / "secrets",      # notify-token, etc.
+        h / "mcp-tokens",          # per-server MCP OAuth tokens
+        h / "auth",                # google_oauth.json (+ .lock)
+        h / "secrets",             # notify-token, etc.
+        h / "weixin" / "accounts", # per-account Weixin bearer tokens
     ]
 
 
@@ -65,7 +66,11 @@ def build_write_denied_paths(home: str) -> set[str]:
         "/etc/shadow",
     ]
     hermes_paths = [str(p) for p in hermes_secret_store_files()]
-    return {os.path.realpath(p) for p in (system_paths + hermes_paths)}
+    # Deny the secret directory ROOTS themselves too (not just their children
+    # via the prefix list) so a write at the bare dir path on a fresh profile
+    # can't shadow the dir and break future credential persistence.
+    hermes_dir_roots = [str(d) for d in hermes_secret_store_dirs()]
+    return {os.path.realpath(p) for p in (system_paths + hermes_paths + hermes_dir_roots)}
 
 
 def build_write_denied_prefixes(home: str) -> list[str]:

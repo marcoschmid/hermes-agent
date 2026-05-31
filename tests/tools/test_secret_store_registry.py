@@ -35,7 +35,12 @@ SECRET_STORES = [
     "slack_tokens.json",
     "secrets/notify-token",
     "whatsapp/session/creds.json",
+    "weixin/accounts/acct123.json",
 ]
+
+# Secret directory roots themselves must be write-denied (else a write at the
+# dir path on a fresh profile blocks future credential persistence).
+SECRET_DIR_ROOTS = ["mcp-tokens", "auth", "secrets", "weixin/accounts"]
 
 BENIGN_STORES = [
     "config.yaml",
@@ -57,6 +62,14 @@ class TestSecretStoreRegistryRead:
 class TestSecretStoreRegistryWrite:
     @pytest.mark.parametrize("rel", SECRET_STORES)
     def test_write_denied(self, rel):
+        path = str(get_hermes_home() / rel)
+        assert is_write_denied(path) is True, rel
+
+
+class TestSecretDirRootsWriteDenied:
+    @pytest.mark.parametrize("rel", SECRET_DIR_ROOTS)
+    def test_dir_root_write_denied(self, rel):
+        # Exact directory path (no trailing slash) must be write-denied too.
         path = str(get_hermes_home() / rel)
         assert is_write_denied(path) is True, rel
 
