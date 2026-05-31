@@ -32,6 +32,7 @@ import httpx
 
 from gateway.hub.hub_state import HubState
 from gateway.hub.registry_client import RegistryClient, RegistryUnavailable
+from gateway.hub.severance import mc_writes_severed
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,12 @@ class RegistrySync:
 
         Returns per-table row counts (the count synced for each table).
         """
+        # Phase-6b Step-7: severed → no-op pull. After the api_key revoke the
+        # token is dead; skipping avoids hammering MC with doomed 401s every
+        # interval. The mirror keeps serving its last pre-revoke snapshot.
+        if mc_writes_severed():
+            logger.info("registry_sync: MC writes severed (Phase-6b); skipping pull")
+            return {}
         # --- Fetch phase (no DB writes yet) ------------------------------
         sources = await self._fetch_list(_LIST_PATHS["sources"])
         topics = await self._fetch_list(_LIST_PATHS["topics"])

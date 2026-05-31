@@ -279,6 +279,28 @@ async def _count(state, table: str) -> int:
 
 
 @pytest.mark.asyncio
+async def test_sync_once_severed_makes_no_mc_call(tmp_path, monkeypatch) -> None:
+    """Phase-6b Step-7: severed → sync_once is a no-op (no MC GET), so after the
+    api_key revoke the pull loop doesn't hammer MC with doomed 401s. The mirror
+    keeps serving its last pre-revoke snapshot."""
+    monkeypatch.setenv("HUB_MC_WRITE_SEVERED", "1")
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"data": []})
+
+    registry = make_registry(handler)
+    state = await _make_state(tmp_path, monkeypatch)
+    try:
+        result = await RegistrySync(registry, state).sync_once()
+        assert calls["n"] == 0
+        assert result == {}
+    finally:
+        await state.close()
+
+
+@pytest.mark.asyncio
 async def test_sync_once_pulls_all_tables_into_mirror(tmp_path, monkeypatch) -> None:
     registry = make_registry(_ok_handler())
     state = await _make_state(tmp_path, monkeypatch)
