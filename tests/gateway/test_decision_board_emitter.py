@@ -49,6 +49,21 @@ def test_emit_skipped_when_secret_missing(monkeypatch):
     assert ok is False
 
 
+def test_emit_severed_skips_post(_emitter, monkeypatch):
+    """Phase-6b Step-7: severed → no MC ingest POST, returns False (drop).
+
+    Secret is set (via _emitter), so only the severance guard stops the post.
+    """
+    monkeypatch.setenv("HUB_MC_WRITE_SEVERED", "1")
+    ae = _emitter
+    with patch.object(ae.httpx, "post") as post_mock:
+        ok = ae.emit_approval_to_decision_board(
+            session_key="x", command="c", pattern_key="p", description="d",
+        )
+    assert ok is False
+    assert post_mock.call_count == 0
+
+
 def test_emit_returns_false_on_5xx(_emitter):
     ae = _emitter
     with patch.object(ae.httpx, "post") as post_mock:
