@@ -41,6 +41,13 @@ class TestWriteDenyExactPaths:
         path = str(get_hermes_home() / ".env")
         assert _is_write_denied(path) is True
 
+    def test_hermes_auth_json(self):
+        # ``auth.json`` under the active HERMES_HOME is the OAuth/token store
+        # and must never be writable by agent file tools.
+        from hermes_constants import get_hermes_home
+        path = str(get_hermes_home() / "auth.json")
+        assert _is_write_denied(path) is True
+
     def test_shell_profiles(self):
         home = str(Path.home())
         for name in [".bashrc", ".zshrc", ".profile", ".bash_profile", ".zprofile"]:
@@ -74,6 +81,13 @@ class TestWriteDenyPrefixes:
 
     def test_systemd_prefix(self):
         assert _is_write_denied("/etc/systemd/system/evil.service") is True
+
+    def test_hermes_mcp_tokens_prefix(self):
+        # MCP OAuth token files live under HERMES_HOME/mcp-tokens/ and must
+        # never be writable by agent file tools.
+        from hermes_constants import get_hermes_home
+        path = str(get_hermes_home() / "mcp-tokens" / "some-server.json")
+        assert _is_write_denied(path) is True
 
 
 class TestWriteAllowed:
