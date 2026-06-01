@@ -16,52 +16,78 @@ def _hermes_home_path() -> Path:
         return Path(os.path.expanduser("~/.hermes"))
 
 
+def hermes_secret_store_files() -> set[Path]:
+    """Exact HERMES_HOME credential-store files the agent must never read or write.
+
+    The agent process runs as the owner of HERMES_HOME, so OS permissions do
+    not protect these from the agent's own file tools. This is the single
+    registry shared by both the read guard (get_read_block_error) and the write
+    deny list — add new credential stores here, not in two places.
+    """
+    h = _hermes_home_path()
+    return {
+        h / "auth.json",                       # hermes_cli auth / token store
+        h / ".env",                            # provider keys
+        h / ".anthropic_oauth.json",           # anthropic PKCE OAuth tokens
+        h / "slack_tokens.json",               # Slack OAuth tokens
+        h / "whatsapp" / "session" / "creds.json",  # WhatsApp session creds
+    }
+
+
+def hermes_secret_store_dirs() -> list[Path]:
+    """HERMES_HOME credential-store directories — any file within is protected."""
+    h = _hermes_home_path()
+    return [
+        h / "mcp-tokens",          # per-server MCP OAuth tokens
+        h / "auth",                # google_oauth.json (+ .lock)
+        h / "secrets",             # notify-token, etc.
+        h / "weixin" / "accounts", # per-account Weixin bearer tokens
+    ]
+
+
 def build_write_denied_paths(home: str) -> set[str]:
     """Return exact sensitive paths that must never be written."""
-    hermes_home = _hermes_home_path()
-    return {
-        os.path.realpath(p)
-        for p in [
-            os.path.join(home, ".ssh", "authorized_keys"),
-            os.path.join(home, ".ssh", "id_rsa"),
-            os.path.join(home, ".ssh", "id_ed25519"),
-            os.path.join(home, ".ssh", "config"),
-            str(hermes_home / ".env"),
-            str(hermes_home / "auth.json"),
-            os.path.join(home, ".bashrc"),
-            os.path.join(home, ".zshrc"),
-            os.path.join(home, ".profile"),
-            os.path.join(home, ".bash_profile"),
-            os.path.join(home, ".zprofile"),
-            os.path.join(home, ".netrc"),
-            os.path.join(home, ".pgpass"),
-            os.path.join(home, ".npmrc"),
-            os.path.join(home, ".pypirc"),
-            "/etc/sudoers",
-            "/etc/passwd",
-            "/etc/shadow",
-        ]
-    }
+    system_paths = [
+        os.path.join(home, ".ssh", "authorized_keys"),
+        os.path.join(home, ".ssh", "id_rsa"),
+        os.path.join(home, ".ssh", "id_ed25519"),
+        os.path.join(home, ".ssh", "config"),
+        os.path.join(home, ".bashrc"),
+        os.path.join(home, ".zshrc"),
+        os.path.join(home, ".profile"),
+        os.path.join(home, ".bash_profile"),
+        os.path.join(home, ".zprofile"),
+        os.path.join(home, ".netrc"),
+        os.path.join(home, ".pgpass"),
+        os.path.join(home, ".npmrc"),
+        os.path.join(home, ".pypirc"),
+        "/etc/sudoers",
+        "/etc/passwd",
+        "/etc/shadow",
+    ]
+    hermes_paths = [str(p) for p in hermes_secret_store_files()]
+    # Deny the secret directory ROOTS themselves too (not just their children
+    # via the prefix list) so a write at the bare dir path on a fresh profile
+    # can't shadow the dir and break future credential persistence.
+    hermes_dir_roots = [str(d) for d in hermes_secret_store_dirs()]
+    return {os.path.realpath(p) for p in (system_paths + hermes_paths + hermes_dir_roots)}
 
 
 def build_write_denied_prefixes(home: str) -> list[str]:
     """Return sensitive directory prefixes that must never be written."""
-    hermes_home = _hermes_home_path()
-    return [
-        os.path.realpath(p) + os.sep
-        for p in [
-            str(hermes_home / "mcp-tokens"),
-            os.path.join(home, ".ssh"),
-            os.path.join(home, ".aws"),
-            os.path.join(home, ".gnupg"),
-            os.path.join(home, ".kube"),
-            "/etc/sudoers.d",
-            "/etc/systemd",
-            os.path.join(home, ".docker"),
-            os.path.join(home, ".azure"),
-            os.path.join(home, ".config", "gh"),
-        ]
+    system_dirs = [
+        os.path.join(home, ".ssh"),
+        os.path.join(home, ".aws"),
+        os.path.join(home, ".gnupg"),
+        os.path.join(home, ".kube"),
+        "/etc/sudoers.d",
+        "/etc/systemd",
+        os.path.join(home, ".docker"),
+        os.path.join(home, ".azure"),
+        os.path.join(home, ".config", "gh"),
     ]
+    hermes_dirs = [str(d) for d in hermes_secret_store_dirs()]
+    return [os.path.realpath(p) + os.sep for p in (system_dirs + hermes_dirs)]
 
 
 def get_safe_write_root() -> Optional[str]:
@@ -103,8 +129,10 @@ def get_read_block_error(path: str) -> Optional[str]:
     # The agent process runs as the owner of HERMES_HOME, so OS permissions
     # do not protect these files from the agent's own file-read tool. Block
     # them at the application layer to prevent token/secret exfiltration.
-    secret_files = {hermes_home / "auth.json", hermes_home / ".env"}
-    secret_dirs = [hermes_home / "mcp-tokens"]
+    # Single registry shared with the write deny list (file safety invariant:
+    # add credential stores in hermes_secret_store_files/dirs, not here).
+    secret_files = {p.resolve() for p in hermes_secret_store_files()}
+    secret_dirs = [d.resolve() for d in hermes_secret_store_dirs()]
     is_secret = resolved in secret_files
     if not is_secret:
         for sd in secret_dirs:
