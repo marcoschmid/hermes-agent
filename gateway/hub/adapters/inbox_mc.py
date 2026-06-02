@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from gateway.hub.adapters.errors import AdapterDeliveryError
 from gateway.hub.schemas import NotificationIntent
+from gateway.hub.severance import mc_writes_severed
 
 if TYPE_CHECKING:
     from gateway.hub.adapter_registry import AdapterResult
@@ -83,6 +84,14 @@ class InboxMcAdapter:
             raise AdapterDeliveryError(422, exc.json()) from exc
 
     async def send(self, event: dict, channel: dict) -> "AdapterResult":
+        # Phase-6b Step-7: severed → never POST to MC. inbox_mc is retired at
+        # apply-time (channel-set members removed); this guard guarantees a
+        # stray dispatch can't write to MC after the api_key is revoked. Fail
+        # loudly rather than fake a delivery.
+        if mc_writes_severed():
+            raise AdapterDeliveryError(
+                "severed", "inbox_mc retired (Phase-6b write-severance) — no MC write"
+            )
         token = self._resolve_token()
         payload = self._validate_event(event)
         started = time.monotonic()

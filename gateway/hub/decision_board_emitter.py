@@ -15,6 +15,8 @@ from typing import Any
 
 import httpx
 
+from gateway.hub.severance import mc_writes_severed
+
 logger = logging.getLogger(__name__)
 
 INGEST_URL = os.environ.get(
@@ -54,6 +56,13 @@ def emit_approval_to_decision_board(
     Returns True on success. Silently returns False on any failure
     (network, missing secret, etc) -- never raises.
     """
+    # Phase-6b Step-7: severed → drop the MC decision-board ingest POST. The
+    # Decision-Board keeps running off its own Paperclip-pull worker; the
+    # sparse/stale hermes emit is dropped (Marco 2026-05-31).
+    if mc_writes_severed():
+        logger.debug("decision_board_emitter: MC writes severed (Phase-6b); skipping")
+        return False
+
     if not HUB_SECRET:
         logger.debug("decision_board_emitter: HUB_SECRET not configured; skipping")
         return False

@@ -43,6 +43,7 @@ import requests
 
 from .fallback_channels import FallbackNotificationRouter
 from .hub.hmac_sign import sign as hmac_sign
+from .hub.severance import mc_writes_severed
 
 log = logging.getLogger(__name__)
 
@@ -235,6 +236,10 @@ def make_mc_sender(
     endpoint = mc_url.rstrip("/") + "/api/board/notifications/events"
 
     def sender(message: str, issue: dict[str, Any] | None = None, **_: Any) -> dict[str, Any]:
+        # Phase-6b Step-7: severed → never POST to MC. Return ok:False so the
+        # P4 Track C fallback cascade advances to the direct telegram sender.
+        if mc_writes_severed():
+            return {"ok": False, "error": "mc: severed (Phase-6b) — forcing fallback"}
         # P4 Track A2 Wave-1: MC audit-only sink does not push to Telegram and
         # has no button-rendering. Refuse when buttons present so cascade
         # advances to direct-sender (safe_telegram_send.sh --buttons).

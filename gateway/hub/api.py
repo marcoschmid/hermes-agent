@@ -22,7 +22,9 @@ from gateway.hub.hub_state import HubState, connect as hub_state_connect
 from gateway.hub.nonce_store import remember_or_replay
 from gateway.hub.pipeline import PipelineError, run_pipeline
 from gateway.hub.registry_client import RegistryClient, RegistryUnavailable
+from gateway.hub.registry_sync import RegistrySync
 from gateway.hub.schemas import NotificationIntent
+from gateway.hub.secret_store import get_secret_store
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +205,11 @@ async def _authenticate(request: Request, body: bytes) -> str:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error_code": "unknown_source", "message": f"Source {source_slug} not registered"},
         )
-    secret = source.get("hub_secret")
+    # Step-6 secret source: prefer the inline hub_secret (mc-mode), else fall
+    # back to the local file-backed secret store (mirror-mode, where the
+    # source-dict is secret-free). The fallback is short-circuited when the
+    # inline secret is present, so the default mc-mode path is unchanged.
+    secret = source.get("hub_secret") or get_secret_store().get_hub_secret(source_slug)
     if not secret:
         await _audit_auth_failed(
             "no_hub_secret",
@@ -419,3 +425,56 @@ async def simulate(request: Request) -> dict:
             "audit_trace": trace,
         }
     }
+
+
+def _require_pilot_token(request: Request) -> None:
+    """Admin guard: a valid HUB_PILOT_TOKEN Bearer is mandatory.
+
+    Reuses the same constant-time compare_digest check as the back-compat
+    notifications path (~:140-144). Unlike that path, the pilot token here is
+    the ONLY accepted credential — admin endpoints are operator-only and have
+    no HMAC fallback. Raises 401 on any mismatch/missing token.
+    """
+    from hmac import compare_digest
+
+    pilot_token = os.environ.get("HUB_PILOT_TOKEN", "")
+    if not pilot_token:
+        # No configured token → fail closed: admin endpoints stay locked rather
+        # than implicitly accepting any/empty Bearer. (Behaviour matches the
+        # `pilot_token and ...` short-circuit below; made explicit for intent.)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error_code": "missing_auth", "message": "Bearer HUB_PILOT_TOKEN required"},
+        )
+    auth_header = request.headers.get("authorization", "")
+    if pilot_token and auth_header.startswith("Bearer "):
+        bearer = auth_header[len("Bearer "):].strip()
+        if compare_digest(bearer.encode(), pilot_token.encode()):
+            return
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={"error_code": "missing_auth", "message": "Bearer HUB_PILOT_TOKEN required"},
+    )
+
+
+@router.post("/v1/admin/registry-sync-now")
+async def registry_sync_now(request: Request) -> dict:
+    """Operator-triggered full-table registry mirror sync (Phase 6b Step 4b).
+
+    Pulls the entire notification registry from Mission Control into the local
+    SQLite mirror and returns per-table row counts. A transient MC outage
+    surfaces as a typed 503 `registry_unavailable` (never an uncaught 500),
+    consistent with the read path's channel-isolation contract.
+
+    Read-only to dispatch: the mirror is not yet consulted at send time (that
+    is Step 5), so triggering a sync cannot change routing behaviour.
+    """
+    _require_pilot_token(request)
+
+    sync = RegistrySync(get_registry(), await get_hub_state())
+    try:
+        counts = await sync.sync_once()
+    except RegistryUnavailable as exc:
+        raise _registry_unavailable_exc() from exc
+
+    return {"data": counts}
