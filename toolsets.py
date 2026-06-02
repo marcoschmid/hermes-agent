@@ -60,6 +60,8 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # Paperclip project-memory (gated on PAPERCLIP_API_TOKEN via requires_env)
+    "pm_decisions", "pm_documents",
 ]
 
 
