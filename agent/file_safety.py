@@ -46,6 +46,7 @@ def hermes_secret_store_files() -> set[Path]:
             h / ".anthropic_oauth.json",                # anthropic PKCE OAuth tokens
             h / "slack_tokens.json",                    # Slack OAuth tokens
             h / "whatsapp" / "session" / "creds.json",  # WhatsApp session creds
+            h / "auth" / "google_oauth.json",           # Google OAuth token (specific file, not whole auth/ dir)
         })
     return files
 
@@ -60,10 +61,13 @@ def hermes_secret_store_dirs() -> list[Path]:
     for h in (_hermes_home_path(), _hermes_root_path()):
         dirs.extend([
             h / "mcp-tokens",          # per-server MCP OAuth tokens
-            h / "auth",                # google_oauth.json (+ .lock)
             h / "secrets",             # notify-token, etc.
             h / "weixin" / "accounts", # per-account Weixin bearer tokens
         ])
+        # NOTE: the whole ``auth/`` dir is intentionally NOT listed — upstream
+        # blocks only the real secret (auth/google_oauth.json, in
+        # hermes_secret_store_files) and deliberately allows non-secret auth/*
+        # files to be read (test_non_secret_auth_subtree_file_not_blocked).
     return dirs
 
 
@@ -244,34 +248,6 @@ def get_read_block_error(path: str) -> Optional[str]:
     """
     resolved = Path(path).expanduser().resolve()
 
-    # ── Fork secret-store registry guard ──────────────────────────────
-    # Catches credential stores the upstream credential_file_names list below
-    # does not enumerate (slack_tokens.json, whatsapp creds, secrets/,
-    # weixin/accounts/). The registry already resolves over both profile-home
-    # and root. Single registry shared with the write deny list — add stores
-    # in hermes_secret_store_files/dirs, not here.
-    secret_files = {p.resolve() for p in hermes_secret_store_files()}
-    secret_dirs = [d.resolve() for d in hermes_secret_store_dirs()]
-    is_secret = resolved in secret_files
-    if not is_secret:
-        for sd in secret_dirs:
-            try:
-                resolved.relative_to(sd)
-                is_secret = True
-                break
-            except ValueError:
-                continue
-    # /proc/.../environ leaks the process environment (provider keys). Covers
-    # /proc/<pid>/environ, /proc/self/environ, /proc/<pid>/task/<tid>/environ.
-    if not is_secret and str(resolved).startswith("/proc/") and resolved.name == "environ":
-        is_secret = True
-    if is_secret:
-        return (
-            f"Access denied: {path} is a sensitive Hermes secret store "
-            "and cannot be read directly. Use the appropriate Hermes tool "
-            "if you need credential-backed functionality."
-        )
-
     # Resolve BOTH the active HERMES_HOME (profile-aware) AND the global
     # Hermes root so credential stores at <root>/auth.json etc. are also
     # blocked when running under a profile (HERMES_HOME points at
@@ -362,6 +338,35 @@ def get_read_block_error(path: str) -> Optional[str]:
             "and cannot be read to prevent credential leakage. "
             "If you need to check the file structure, read .env.example instead. "
             "(Defense-in-depth — not a security boundary; the terminal tool can still bypass.)"
+        )
+
+    # ── Fork secret-store registry guard (runs LAST) ──────────────────
+    # Supplements upstream's checks above with fork-only credential stores the
+    # upstream credential_file_names list does not enumerate (slack_tokens.json,
+    # whatsapp creds, secrets/, weixin/accounts/, auth/google_oauth.json). Runs
+    # AFTER upstream so shared stores (auth.json, mcp-tokens, .env, ...) keep
+    # upstream's "credential store" wording. Single registry shared with the
+    # write deny list — add stores in hermes_secret_store_files/dirs, not here.
+    secret_files = {p.resolve() for p in hermes_secret_store_files()}
+    secret_dirs = [d.resolve() for d in hermes_secret_store_dirs()]
+    is_secret = resolved in secret_files
+    if not is_secret:
+        for sd in secret_dirs:
+            try:
+                resolved.relative_to(sd)
+                is_secret = True
+                break
+            except ValueError:
+                continue
+    # /proc/.../environ leaks the process environment (provider keys). Covers
+    # /proc/<pid>/environ, /proc/self/environ, /proc/<pid>/task/<tid>/environ.
+    if not is_secret and str(resolved).startswith("/proc/") and resolved.name == "environ":
+        is_secret = True
+    if is_secret:
+        return (
+            f"Access denied: {path} is a sensitive Hermes secret store "
+            "and cannot be read directly. Use the appropriate Hermes tool "
+            "if you need credential-backed functionality."
         )
 
     return None

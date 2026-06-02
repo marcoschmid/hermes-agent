@@ -1469,13 +1469,18 @@ def run_conversation(
                     agent._buffer_vprint(f"   ⏱️  {_failure_hint}")
                     
                     if retry_count >= max_retries:
-                        # Try fallback before giving up
-                        agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-                        if agent._try_activate_fallback():
-                            retry_count = 0
-                            compression_attempts = 0
-                            primary_recovery_attempted = False
-                            continue
+                        # Try fallback before giving up — but only claim we're
+                        # "trying fallback" when one is actually configured
+                        # (fork UX: don't mislead when the chain is exhausted).
+                        if agent._fallback_index < len(agent._fallback_chain):
+                            agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
+                            if agent._try_activate_fallback():
+                                retry_count = 0
+                                compression_attempts = 0
+                                primary_recovery_attempted = False
+                                continue
+                        else:
+                            agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — no fallback configured.")
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
                         agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
@@ -3219,13 +3224,18 @@ def run_conversation(
                         primary_recovery_attempted = True
                         retry_count = 0
                         continue
-                    # Try fallback before giving up entirely
-                    agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
-                        retry_count = 0
-                        compression_attempts = 0
-                        primary_recovery_attempted = False
-                        continue
+                    # Try fallback before giving up entirely — but only claim
+                    # we're "trying fallback" when one is actually configured
+                    # (fork UX: don't mislead when the chain is exhausted).
+                    if agent._fallback_index < len(agent._fallback_chain):
+                        agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+                        if agent._try_activate_fallback():
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            continue
+                    else:
+                        agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — no fallback configured.")
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)
