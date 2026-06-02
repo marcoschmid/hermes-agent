@@ -182,6 +182,16 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities."
 )
 
+PM_GUIDANCE = (
+    "You have Paperclip project-memory tools for the project you are working on. "
+    "Before substantial work, load context: pm_documents(action='get', project_id=<id>, "
+    "key='project-memory') for the running memory document and pm_decisions(action='list', "
+    "project_id=<id>) for prior decisions. After significant work, persist what matters: "
+    "pm_documents(action='upsert', ...) for memory and pm_decisions(action='upsert', ...) for "
+    "new decisions. Take company_id and project_id from the current issue/project context — "
+    "do not invent them; skip these tools if the project is unknown."
+)
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "
