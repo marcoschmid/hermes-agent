@@ -104,7 +104,9 @@ class RegistrySync:
         """
         client = self._registry.get_http_client()
         try:
-            resp = await client.get(path)
+            # MC's Next.js routes 308-redirect trailing-slash list paths to the
+            # canonical no-slash URL; follow it so the pull doesn't raise on 308.
+            resp = await client.get(path, follow_redirects=True)
         except httpx.TransportError as exc:  # TimeoutException is a subclass
             raise RegistryUnavailable(None, f"GET {path}: {type(exc).__name__}") from exc
         if resp.status_code in (401, 403) or resp.status_code >= 500:
