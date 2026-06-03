@@ -34,9 +34,10 @@ def test_serial_tool_calls_on_codex():
 
 def test_gpt55_payload_sanitized():
     kw = _build("gpt-5.5")
-    # encrypted-reasoning replay removed, store=true, effort de-escalated
+    # encrypted-reasoning replay removed + effort de-escalated.
+    # store MUST stay False — Codex Responses contract enforces it.
     assert "reasoning.encrypted_content" not in kw.get("include", [])
-    assert kw.get("store") is True
+    assert kw.get("store") is False
     assert kw.get("reasoning", {}).get("effort") not in {"high", "xhigh"}
 
 

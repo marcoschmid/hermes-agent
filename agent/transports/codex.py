@@ -152,8 +152,10 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["parallel_tool_calls"] = False
             # gpt-5.5 is stricter than gpt-5.4 and degenerates (silent-drop /
             # tool-call text-leak) when sent xhigh reasoning + encrypted-reasoning
-            # replay + store=false (#21444). Minimize the payload for gpt-5.5 only
-            # so it emits structured function_call items instead of leaking text.
+            # replay (#21444). De-escalate reasoning effort and drop the encrypted
+            # reasoning replay for gpt-5.5 so it emits structured function_call
+            # items instead of leaking text. NOTE: `store` MUST stay False — the
+            # Codex Responses contract enforces it (codex_responses_adapter.py:737).
             if str(model).startswith("gpt-5.5"):
                 if isinstance(kwargs.get("reasoning"), dict):
                     _eff = kwargs["reasoning"].get("effort")
@@ -163,7 +165,6 @@ class ResponsesApiTransport(ProviderTransport):
                     kwargs["include"] = [
                         i for i in kwargs["include"] if i != "reasoning.encrypted_content"
                     ]
-                kwargs["store"] = True
 
         return kwargs
 
