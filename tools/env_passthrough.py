@@ -113,21 +113,26 @@ def _load_config_passthrough() -> frozenset[str]:
         passthrough = cfg_get(cfg, "terminal", "env_passthrough")
         if isinstance(passthrough, list):
             for item in passthrough:
-                if isinstance(item, str) and item.strip():
-                    name = item.strip()
-                    if _is_hermes_provider_credential(name):
-                        # GHSA-rhgp-j443-p4rf: never pass Hermes-managed
-                        # provider credentials through to sandboxes, even
-                        # when listed in the user's config.yaml.
-                        logger.warning(
-                            "env passthrough: ignoring Hermes provider "
-                            "credential %s from config.yaml; provider "
-                            "credentials are never passed to sandboxes "
-                            "(see GHSA-rhgp-j443-p4rf).",
-                            name,
-                        )
-                        continue
-                    result.add(name)
+                if not isinstance(item, str) or not item.strip():
+                    continue
+                name = item.strip()
+                # Mirror the skill-path filter in register_env_passthrough:
+                # Hermes-managed provider credentials must not be passed
+                # through to execute_code / terminal children, regardless of
+                # whether the request came from a skill or from config.yaml.
+                # See GHSA-rhgp-j443-p4rf.
+                if _is_hermes_provider_credential(name):
+                    logger.warning(
+                        "env passthrough: refusing to register Hermes "
+                        "provider credential %r from config.yaml (blocked "
+                        "by _HERMES_PROVIDER_ENV_BLOCKLIST). Operator "
+                        "configuration must not override the execute_code "
+                        "sandbox's credential scrubbing; see "
+                        "GHSA-rhgp-j443-p4rf.",
+                        name,
+                    )
+                    continue
+                result.add(name)
     except Exception as e:
         logger.debug("Could not read tools.env_passthrough from config: %s", e)
 

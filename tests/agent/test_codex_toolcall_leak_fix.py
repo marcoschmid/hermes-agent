@@ -1,15 +1,16 @@
-"""Tests for the codex tool-call-leak silent-bot fix (2026-06-03).
+"""Tests for the codex tool-call-leak silent-bot fix (2026-06-03), forward-ported
+onto the 0.15.2 upstream port.
 
-Covers: aux model off rejected *-codex slug, serial tool calls + gpt-5.5
-payload sanitizer in the request builder, and Harmony tool-call-leak recovery.
+Covers: serial tool calls + gpt-5.5 payload sanitizer in the Responses request
+builder, and Harmony tool-call-leak recovery in the response normalizer.
+
+NOTE vs the 0.11 origin (eaf6f496e): 0.15.2 deliberately removed the hardcoded
+``_CODEX_AUX_MODEL`` constant (auxiliary_client picks the model from config /
+caller). The "aux model must be a served slug, not a rejected *-codex slug"
+concern is therefore a config invariant on 0.15.2 (verified at cutover), not a
+code constant — so the origin's aux-model test does not apply here.
 """
 import json
-
-
-def test_codex_aux_model_is_chatgpt_account_supported():
-    from agent.auxiliary_client import _CODEX_AUX_MODEL
-    assert "-codex" not in _CODEX_AUX_MODEL  # ChatGPT-account codex rejects *-codex
-    assert _CODEX_AUX_MODEL in {"gpt-5.5", "gpt-5.4", "gpt-5.4-mini"}
 
 
 def _build(model, **extra):
