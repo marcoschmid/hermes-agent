@@ -984,6 +984,72 @@ def _extract_responses_reasoning_text(item: Any) -> str:
 # Full response normalization
 # ---------------------------------------------------------------------------
 
+def _extract_balanced_json(text: str, start: int) -> Optional[Any]:
+    """Parse the first balanced ``{...}`` JSON object at/after ``start``.
+
+    Honors string literals/escapes so braces inside JSON strings don't throw
+    off the depth counter. Returns the parsed object, or None if no parseable
+    object is found (best-effort — leaked text is degenerate).
+    """
+    i = text.find("{", start)
+    if i < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for j in range(i, len(text)):
+        c = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[i:j + 1])
+                except Exception:
+                    return None
+    return None
+
+
+def _recover_leaked_tool_calls(text: str) -> List[SimpleNamespace]:
+    """Recover Harmony-leaked tool calls (``to=functions.<name> {json}``) from
+    degenerate assistant text into structured tool_call objects.
+
+    SAFETY: only recovers when there is EXACTLY ONE ``to=functions.<name>``
+    occurrence with valid JSON args. A degenerate multi-leak (e.g. a real call
+    plus a hallucinated tool *result* ``{"stdout": ...}``) is NOT recovered —
+    executing the hallucinated half would be garbage; the caller falls back to
+    the safe incomplete path. This recovers the common single-clean-call gpt-5.x
+    degeneration into real tool execution while never trusting a noisy leak.
+    """
+    matches = list(re.finditer(r"to=functions\.([A-Za-z_][\w.]*)", text, re.IGNORECASE))
+    if len(matches) != 1:
+        return []
+    m = matches[0]
+    fn_name = m.group(1)
+    parsed = _extract_balanced_json(text, m.end())
+    if not isinstance(parsed, dict):
+        return []
+    arguments = json.dumps(parsed, ensure_ascii=False)
+    call_id = _deterministic_call_id(fn_name, arguments, 0)
+    return [SimpleNamespace(
+        id=call_id,
+        call_id=call_id,
+        response_item_id=_derive_responses_function_call_id(call_id, None),
+        type="function",
+        function=SimpleNamespace(name=fn_name, arguments=arguments),
+    )]
+
+
 def _normalize_codex_response(
     response: Any,
     *,
@@ -1180,17 +1246,31 @@ def _normalize_codex_response(
     # append, dedup, and retry budget.
     leaked_tool_call_text = False
     if final_text and not tool_calls and _TOOL_CALL_LEAK_PATTERN.search(final_text):
-        leaked_tool_call_text = True
-        logger.warning(
-            "Codex response contains leaked tool-call text in assistant content "
-            "(no structured function_call items). Treating as incomplete so the "
-            "continuation path can re-elicit a proper tool call. Leaked snippet: %r",
-            final_text[:300],
-        )
-        # Clear the text so downstream code doesn't surface the garbage as
-        # a summary. The encrypted reasoning items (if any) are preserved
-        # so the model keeps its chain-of-thought on the retry.
-        final_text = ""
+        recovered = _recover_leaked_tool_calls(final_text)
+        if recovered:
+            # gpt-5.x leaked its tool call as Harmony text but the intent is
+            # clean (valid JSON args). Recover it into structured tool calls so
+            # the turn actually executes the tool instead of looping to silence.
+            logger.warning(
+                "Recovered %d leaked Harmony tool-call(s) into structured "
+                "function_call items (gpt-5.x degeneration). Snippet: %r",
+                len(recovered), final_text[:200],
+            )
+            tool_calls.extend(recovered)
+            final_text = ""
+        else:
+            leaked_tool_call_text = True
+            logger.warning(
+                "Codex response contains leaked tool-call text in assistant content "
+                "(no structured function_call items, recovery failed). Treating as "
+                "incomplete so the continuation path can re-elicit a proper tool "
+                "call. Leaked snippet: %r",
+                final_text[:300],
+            )
+            # Clear the text so downstream code doesn't surface the garbage as
+            # a summary. The encrypted reasoning items (if any) are preserved
+            # so the model keeps its chain-of-thought on the retry.
+            final_text = ""
 
     assistant_message = SimpleNamespace(
         content=final_text,

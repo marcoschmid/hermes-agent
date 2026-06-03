@@ -218,6 +218,25 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs.pop("timeout", None)
 
         if is_codex_backend:
+            # Serial tool calls match the codex-rs CLI; parallel is a known
+            # Harmony tool-call text-leak trigger on the ChatGPT-account codex
+            # backend (degenerates into `to=functions.X` text). (#21444)
+            kwargs["parallel_tool_calls"] = False
+            # gpt-5.5 degenerates (silent-drop / tool-call text-leak) when sent
+            # xhigh reasoning + encrypted-reasoning replay (#21444). De-escalate
+            # reasoning effort and drop the encrypted-reasoning replay for gpt-5.5
+            # so it emits structured function_call items instead of leaking text.
+            # NOTE: `store` MUST stay False (Codex Responses contract) — it is
+            # already False in the base kwargs above; do NOT set it True here.
+            if str(model).startswith("gpt-5.5"):
+                if isinstance(kwargs.get("reasoning"), dict):
+                    _eff = kwargs["reasoning"].get("effort")
+                    if _eff in {"high", "xhigh"}:
+                        kwargs["reasoning"] = {**kwargs["reasoning"], "effort": "medium"}
+                if isinstance(kwargs.get("include"), list):
+                    kwargs["include"] = [
+                        i for i in kwargs["include"] if i != "reasoning.encrypted_content"
+                    ]
             prompt_cache_key = kwargs.get("prompt_cache_key")
             cache_scope_id = str(prompt_cache_key or session_id or "").strip()
             if cache_scope_id:
