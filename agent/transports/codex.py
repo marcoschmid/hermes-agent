@@ -145,6 +145,26 @@ class ResponsesApiTransport(ProviderTransport):
         if is_xai_responses and session_id:
             kwargs["extra_headers"] = {"x-grok-conv-id": session_id}
 
+        if is_codex_backend:
+            # Serial tool calls match the codex-rs CLI; parallel is a known
+            # Harmony tool-call text-leak trigger on the ChatGPT-account codex
+            # backend (degenerates into `to=functions.X` text). (#21444)
+            kwargs["parallel_tool_calls"] = False
+            # gpt-5.5 is stricter than gpt-5.4 and degenerates (silent-drop /
+            # tool-call text-leak) when sent xhigh reasoning + encrypted-reasoning
+            # replay + store=false (#21444). Minimize the payload for gpt-5.5 only
+            # so it emits structured function_call items instead of leaking text.
+            if str(model).startswith("gpt-5.5"):
+                if isinstance(kwargs.get("reasoning"), dict):
+                    _eff = kwargs["reasoning"].get("effort")
+                    if _eff in {"high", "xhigh"}:
+                        kwargs["reasoning"] = {**kwargs["reasoning"], "effort": "medium"}
+                if isinstance(kwargs.get("include"), list):
+                    kwargs["include"] = [
+                        i for i in kwargs["include"] if i != "reasoning.encrypted_content"
+                    ]
+                kwargs["store"] = True
+
         return kwargs
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:

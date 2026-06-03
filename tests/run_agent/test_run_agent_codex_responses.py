@@ -306,7 +306,7 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert "function" not in kwargs["tools"][0]
     assert kwargs["store"] is False
     assert kwargs["tool_choice"] == "auto"
-    assert kwargs["parallel_tool_calls"] is True
+    assert kwargs["parallel_tool_calls"] is False  # codex backend = serial (CLI-match, anti-leak)
     assert isinstance(kwargs["prompt_cache_key"], str)
     assert len(kwargs["prompt_cache_key"]) > 0
     assert "timeout" not in kwargs
