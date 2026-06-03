@@ -263,7 +263,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 result["response"] = request_client.chat.completions.create(**api_kwargs)
         except Exception as e:
             if agent.api_mode == "codex_responses":
-                logger.error("Codex Responses API worker failed", exc_info=True)
+                logger.error(
+                    "Codex Responses API worker failed. provider=%s model=%s %s",
+                    getattr(agent, "provider", None),
+                    getattr(agent, "model", None),
+                    agent._client_log_context() if hasattr(agent, "_client_log_context") else "",
+                    exc_info=True,
+                )
             result["error"] = e
         finally:
             _close_request_client_once("request_complete")
