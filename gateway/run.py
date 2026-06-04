@@ -247,6 +247,25 @@ def _gateway_provider_error_reply(text: str) -> str:
     )
 
 
+def _finalize_empty_agent_reply(result: Any) -> str:
+    """Last line of defense against a silent bot.
+
+    The interactive turn handler must never send an empty reply. When the
+    agent produced no ``final_response``, surface the (redacted) ``error`` if
+    one is present, otherwise a short safe generic message. A populated
+    ``error`` from an exhausted provider failure (e.g. a Codex/Responses HTTP
+    4xx that fell through retries/fallback) thus always reaches the user
+    instead of silence. Secret-free.
+    """
+    error = result.get("error") if isinstance(result, dict) else None
+    if error:
+        return f"⚠️ {_redact_gateway_user_facing_secrets(str(error))}"
+    return (
+        "⚠️ Keine Antwort vom Modell-Backend erhalten (z. B. HTTP 4xx). "
+        "Details stehen in den Gateway-Logs — bitte erneut versuchen."
+    )
+
+
 _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     r"^\s*(\W*\s*)?("
     r"api\s+(?:call\s+)?failed"
@@ -17259,12 +17278,19 @@ class GatewayRunner:
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
-                error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                error_msg = _finalize_empty_agent_reply(result)
+                # A surfaced error must reach the user even when streaming already
+                # delivered partial/interim text: the downstream `already_sent`
+                # suppression (see "Never skip when the agent failed") only
+                # bypasses for failed turns. Mark error-bearing empty turns failed
+                # so the warning is not swallowed. Empty-but-no-error turns (e.g.
+                # media/voice-only replies) stay non-failed so no spurious warning
+                # is injected when content was already delivered.
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
-                    "failed": result.get("failed", False),
+                    "failed": True if result.get("error") else result.get("failed", False),
                     "partial": result.get("partial", False),
                     "completed": result.get("completed"),
                     "interrupted": result.get("interrupted", False),
