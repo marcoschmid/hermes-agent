@@ -8,12 +8,22 @@
 set -euo pipefail
 
 ENV_FILE="${HOME}/.openclaw/secrets/env/notification-hub-tokens.env"
+PUSHOVER_ENV_FILE="${HOME}/.openclaw/secrets/env/pushover.env"
 HERMES_AGENT_ROOT="${HOME}/Code/hermes-agent"
 
 if [ -f "${ENV_FILE}" ]; then
   set -a
   # shellcheck disable=SC1090
   source "${ENV_FILE}"
+  set +a
+fi
+
+# Pushover credentials (PUSHOVER_API_TOKEN / PUSHOVER_USER_KEY) for the
+# standalone pushover channel router. Kept in a separate secrets file.
+if [ -f "${PUSHOVER_ENV_FILE}" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${PUSHOVER_ENV_FILE}"
   set +a
 fi
 

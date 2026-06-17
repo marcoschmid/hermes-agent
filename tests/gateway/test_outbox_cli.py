@@ -497,3 +497,49 @@ def test_cli_concurrent_init_schema_safe(tmp_path: Path):
 
     cols = {row[1] for row in sqlite3.connect(str(db)).execute("PRAGMA table_info(outbox)").fetchall()}
     assert "claim_token" in cols
+
+
+# ---- Notify ledger: --status -----------------------------------------------
+
+
+def test_cli_status_logged_persists_terminal(tmp_path: Path):
+    """notify routes severity < warn as a terminal `logged` row (Inbox-First):
+    recorded in the ledger, never claimed/sent by the worker."""
+    db = tmp_path / "outbox.db"
+    rc, out, err = _capture([
+        "--channel", "pushover",
+        "--dedup-key", "logged-1",
+        "--message", "info-only ping",
+        "--status", "logged",
+        "--db-path", str(db),
+    ])
+
+    assert rc == 0, err
+    assert json.loads(out)["status"] == "logged"
+    row = _db_row(db, "logged-1")
+    assert row["status"] == "logged"
+
+
+def test_cli_default_status_is_pending(tmp_path: Path):
+    db = tmp_path / "outbox.db"
+    rc, _out, err = _capture([
+        "--channel", "pushover",
+        "--dedup-key", "default-status",
+        "--message", "warn alert",
+        "--db-path", str(db),
+    ])
+
+    assert rc == 0, err
+    assert _db_row(db, "default-status")["status"] == "pending"
+
+
+def test_cli_status_invalid_rejected(tmp_path: Path):
+    db = tmp_path / "outbox.db"
+    with pytest.raises(SystemExit):
+        _capture([
+            "--channel", "pushover",
+            "--dedup-key", "bad-status",
+            "--message", "x",
+            "--status", "bogus",
+            "--db-path", str(db),
+        ])

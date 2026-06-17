@@ -69,6 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Validate args + construct payload, do NOT write to DB. Prints JSON to stdout.")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress success-JSON on stdout (errors still go to stderr).")
+    # notify ledger: initial status. Default 'pending' (worker claims + delivers).
+    # 'logged' = Inbox-First terminal record below push-threshold (never claimed).
+    # 'sent'/'failed' = terminal record written by `notify --direct` after an
+    # inline synchronous send (worker must not re-deliver).
+    p.add_argument("--status", default="pending",
+                   choices=["pending", "logged", "sent", "failed"],
+                   help="Initial outbox status (default: pending).")
     # Round-2 CRITICAL-1: accept-and-ignore legacy safe_telegram_send.sh flags so
     # mechanical migration of bash callers succeeds without rewriting their args.
     # These options no longer apply in async-enqueue world (Worker + Outbox handle
@@ -190,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
             channel=args.channel,
             dedup_key=args.dedup_key,
             payload=payload,
+            status=args.status,
         )
     except Exception as exc:
         print(f"ERROR: outbox enqueue failed: {exc}", file=sys.stderr)

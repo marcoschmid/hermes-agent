@@ -104,9 +104,16 @@ class OutboxStore:
                 dedup_key: str,
                 payload_json: str | None = None,
                 payload: dict[str, Any] | None = None,
+                status: str = "pending",
                 now: datetime | None = None,
                 **_ignored: Any) -> OutboxRow:
-        """Idempotent insert via dedup_key UNIQUE. Returns existing or new row."""
+        """Idempotent insert via dedup_key UNIQUE. Returns existing or new row.
+
+        ``status`` is the initial status (default ``pending`` → worker claims +
+        delivers). A terminal status such as ``logged`` records the row for the
+        ledger without ever being claimed (Inbox-First: log everything, push
+        only on demand).
+        """
         if payload_json is None and payload is not None:
             payload_json = json.dumps(payload, sort_keys=True)
         if payload_json is None:
@@ -118,8 +125,8 @@ class OutboxStore:
             conn.execute(
                 "INSERT OR IGNORE INTO outbox (id, channel, payload_json, dedup_key, "
                 "attempts, last_error, status, next_retry_at, created_at, updated_at, claim_token) "
-                "VALUES (?,?,?,?,0,NULL,'pending',?,?,?,NULL)",
-                (row_id, channel, payload_json, dedup_key, ts, ts, ts),
+                "VALUES (?,?,?,?,0,NULL,?,?,?,?,NULL)",
+                (row_id, channel, payload_json, dedup_key, status, ts, ts, ts),
             )
             row = conn.execute(
                 "SELECT * FROM outbox WHERE dedup_key=?", (dedup_key,)

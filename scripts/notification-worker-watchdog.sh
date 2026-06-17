@@ -48,14 +48,14 @@ alert() {
   fi
   echo "$now_epoch" > "$stamp_file"
   log "ALERT $kind: $msg"
-  if [ -x "$SAFE_SEND" ]; then
-    "$SAFE_SEND" \
-      --target "$TELEGRAM_TARGET" \
-      --context "worker-watchdog-${kind}" \
-      --dedupe-key "worker-watchdog:${kind}:$(date +%Y-%m-%d-%H)" \
-      --message "Notification-Worker-Watchdog: ${msg}" \
-      >/dev/null 2>&1 || log "safe_telegram_send failed"
-  fi
+  /Users/marco/.openclaw/bin/notify \
+    --source notification-worker-watchdog \
+    --severity error \
+    --category system \
+    --direct \
+    --dedupe-key "worker-watchdog:${kind}:$(date +%Y-%m-%d-%H)" \
+    --message "Notification-Worker-Watchdog: ${msg}" \
+    >/dev/null 2>&1 || log "notify failed"
 }
 
 restart_worker() {

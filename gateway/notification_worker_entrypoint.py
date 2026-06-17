@@ -16,6 +16,7 @@ from typing import Callable
 from .fallback_channels import FallbackNotificationRouter
 from .notification_worker import NotificationWorker
 from .outbox import OutboxStore
+from .pushover_router import PushoverRouter
 from .router_factory import make_default_router
 
 log = logging.getLogger(__name__)
@@ -59,13 +60,20 @@ def _resolve_hmac_secret_env(channel: str) -> str:
     return preferred
 
 
-def build_channel_router_factory() -> Callable[[str], FallbackNotificationRouter]:
+def build_channel_router_factory() -> Callable[[str], FallbackNotificationRouter | PushoverRouter]:
     """Return a callable mapping channel-name -> configured Router.
 
     Raises ValueError for unknown channels (caller — NotificationWorker —
     catches and routes to record_failure → eventual dead-letter).
+
+    ``pushover`` is a standalone channel: a sync PushoverRouter that posts
+    directly to the Pushover API, bypassing the (dead) Hub→MC→direct cascade
+    that ``telegram`` uses. This keeps it severance-free and means a dead Hub
+    never delays a Pushover alert.
     """
-    def factory(channel: str) -> FallbackNotificationRouter:
+    def factory(channel: str) -> FallbackNotificationRouter | PushoverRouter:
+        if channel == "pushover":
+            return PushoverRouter.from_env()
         config = CHANNEL_DEFAULTS.get(channel)
         if config is None:
             raise ValueError(f"unknown channel: {channel}")

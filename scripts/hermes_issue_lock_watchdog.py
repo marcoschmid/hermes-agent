@@ -98,15 +98,15 @@ def _send_alert(message: str, chat_id: str) -> None:
     try:
         subprocess.run(
             [
-                str(SAFE_TELEGRAM_SEND),
-                "--target",
-                chat_id,
-                "--context",
-                "hermes_issue_lock_watchdog",
+                "/Users/marco/.openclaw/bin/notify",
+                "--source",
+                "hermes-lock-watchdog",
+                "--severity",
+                "warn",
+                "--category",
+                "system",
                 "--dedupe-key",
                 f"issue-lock-watchdog:{datetime.now(timezone.utc).strftime('%Y-%m-%d-%H')}",
-                "--dedupe-window",
-                "3600",
                 "--message",
                 message,
             ],
