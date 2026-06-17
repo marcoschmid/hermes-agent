@@ -19,6 +19,7 @@ Credentials come from PUSHOVER_API_TOKEN / PUSHOVER_USER_KEY (the names used by
 """
 from __future__ import annotations
 
+import base64
 import os
 import urllib.error
 import urllib.parse
@@ -32,6 +33,30 @@ PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json"
 # Pushover requires both retry+expire for priority=2 (emergency).
 EMERGENCY_RETRY_SECONDS = 120
 EMERGENCY_EXPIRE_SECONDS = 3600
+
+# Image attachment limit (Pushover: 5 MB, one per message).
+ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024
+_IMAGE_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp",
+}
+
+
+def _read_attachment(path: str | None) -> "tuple[str, str] | None":
+    """Return (base64, mime) for a sendable image, or None (text-only fallback)."""
+    if not path:
+        return None
+    try:
+        if not os.path.isfile(path):
+            return None
+        size = os.path.getsize(path)
+        if size == 0 or size > ATTACHMENT_MAX_BYTES:
+            return None
+        mime = _IMAGE_MIME.get(os.path.splitext(path)[1].lower(), "image/png")
+        with open(path, "rb") as fh:
+            return base64.b64encode(fh.read()).decode("ascii"), mime
+    except OSError:
+        return None
 
 SEVERITY_TO_PRIORITY: dict[str, int] = {
     "debug": -2,
@@ -105,11 +130,37 @@ class PushoverRouter:
         device = issue.get("device")
         if device:
             data["device"] = str(device)
-        if severity == "crit":
-            data["sound"] = "siren"
+
+        # Sound: explicit override wins; crit defaults to the siren.
+        sound = issue.get("sound") or ("siren" if severity == "crit" else None)
+        if sound:
+            data["sound"] = str(sound)
+
+        # Deep-link (tap-to-open). Pushover has no inline actions; this is the substitute.
+        url = issue.get("url")
+        if url:
+            data["url"] = str(url)[:512]
+            url_title = issue.get("url_title")
+            if url_title:
+                data["url_title"] = str(url_title)[:100]
+
         if priority == 2:
             data["retry"] = EMERGENCY_RETRY_SECONDS
             data["expire"] = EMERGENCY_EXPIRE_SECONDS
+        else:
+            # Auto-expire low-importance pushes (Pushover ignores ttl for priority=2).
+            ttl = issue.get("ttl")
+            try:
+                ttl_int = int(ttl) if ttl is not None else 0
+            except (TypeError, ValueError):
+                ttl_int = 0
+            if ttl_int > 0:
+                data["ttl"] = ttl_int
+
+        # Image attachment (screenshot/preview/chart). Missing/oversized -> text-only.
+        attachment = _read_attachment(issue.get("image"))
+        if attachment:
+            data["attachment_base64"], data["attachment_type"] = attachment
 
         try:
             status_code, body = self._transport(PUSHOVER_API_URL, data, self._timeout)

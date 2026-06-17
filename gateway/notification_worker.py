@@ -224,8 +224,11 @@ def _payload_to_router_args(row: OutboxRow) -> tuple[str, dict[str, Any]]:
         # Otherwise caller --target X --context Y dispatches to factory-default.
         # P4 Track A2 Wave-1: buttons forwarded for Telegram inline-keyboard
         # via direct-sender (safe_telegram_send.sh --buttons).
+        # Rich rendering keys (image/url/url_title/sound/ttl) are forwarded so the
+        # pushover channel can attach images, deep-links, sounds and auto-expiry.
         for key in ("title", "audience", "labels", "topic", "severity",
-                    "target", "context", "buttons"):
+                    "target", "context", "buttons",
+                    "image", "url", "url_title", "sound", "ttl"):
             if key in payload:
                 issue[key] = payload[key]
         return message, issue
