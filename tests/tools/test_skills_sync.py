@@ -5,6 +5,9 @@ import shutil
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+import tools.skills_sync as skills_sync_module
+
 from tools.skills_sync import (
     _get_bundled_dir,
     _read_manifest,
@@ -12,6 +15,7 @@ from tools.skills_sync import (
     _write_manifest,
     _discover_bundled_skills,
     _compute_relative_dest,
+    _copy_skill_tree_atomic,
     _dir_hash,
     sync_skills,
     reset_bundled_skill,
@@ -51,6 +55,72 @@ class TestReadWriteManifest:
         names = [line.split(":")[0] for line in lines]
         assert names == ["alpha", "middle", "zebra"]
 
+    def test_successful_manifest_publish_consumes_writable_temp_alias(self, tmp_path):
+        manifest_file = tmp_path / ".bundled_manifest"
+        _write_manifest({"skill-a": "abc123"}, manifest_file)
+
+        assert manifest_file.exists()
+        assert list(tmp_path.glob("..bundled_manifest.publish-*")) == []
+
+    def test_manifest_temp_replaced_inside_final_rename_is_quarantined(self, tmp_path):
+        manifest_file = tmp_path / ".bundled_manifest"
+        real_rename = skills_sync_module._rename_noreplace
+        replacement_inode = {}
+        injected = {"done": False}
+
+        def replace_temp_inside_rename(source, destination):
+            source = Path(source)
+            destination = Path(destination)
+            if destination == manifest_file and ".publish-" in source.name and not injected["done"]:
+                injected["done"] = True
+                source.unlink()
+                source.write_bytes(b"foreign manifest payload\n")
+                replacement_inode["value"] = source.lstat().st_ino
+            return real_rename(source, destination)
+
+        with patch(
+            "tools.skills_sync._rename_noreplace",
+            side_effect=replace_temp_inside_rename,
+        ):
+            with pytest.raises(OSError, match="published file changed"):
+                _write_manifest({"skill-a": "abc123"}, manifest_file)
+
+        assert not manifest_file.exists()
+        rejected = list(
+            tmp_path.glob("..bundled_manifest.publish-rejected-retained-*")
+        )
+        assert len(rejected) == 1
+        assert rejected[0].lstat().st_ino == replacement_inode["value"]
+
+    def test_hub_lock_temp_replaced_inside_final_rename_is_quarantined(self, tmp_path):
+        lock_path = tmp_path / ".hub" / "lock.json"
+        data = b'{"version": 1, "installed": {}}\n'
+        real_rename = skills_sync_module._rename_noreplace
+        replacement_inode = {}
+        injected = {"done": False}
+
+        def replace_temp_inside_rename(source, destination):
+            source = Path(source)
+            destination = Path(destination)
+            if destination == lock_path and ".publish-" in source.name and not injected["done"]:
+                injected["done"] = True
+                source.unlink()
+                source.write_bytes(b"foreign hub payload\n")
+                replacement_inode["value"] = source.lstat().st_ino
+            return real_rename(source, destination)
+
+        with patch(
+            "tools.skills_sync._rename_noreplace",
+            side_effect=replace_temp_inside_rename,
+        ):
+            with pytest.raises(OSError, match="published file changed"):
+                skills_sync_module._write_bytes_cas(lock_path, data, None, None)
+
+        assert not lock_path.exists()
+        rejected = list(lock_path.parent.glob(".lock.json.publish-rejected-retained-*"))
+        assert len(rejected) == 1
+        assert rejected[0].lstat().st_ino == replacement_inode["value"]
+
     def test_read_v1_manifest_migration(self, tmp_path):
         """v1 format (plain names, no hashes) should be read with empty hashes."""
         manifest_file = tmp_path / ".bundled_manifest"
@@ -79,6 +149,35 @@ class TestReadWriteManifest:
             result = _read_manifest()
 
         assert result == {"old-skill": "", "new-skill": "abc123"}
+
+    def test_manifest_publish_preserves_same_bytes_new_inode_after_precheck(self, tmp_path):
+        manifest = tmp_path / ".workspace_manifest"
+        original = b"skill:old-hash\n"
+        manifest.write_bytes(original)
+        expected_identity = skills_sync_module._manifest_identity(manifest)
+        foreign_inode = {}
+
+        def replace_before_move(path):
+            if path != manifest:
+                return
+            manifest.unlink()
+            manifest.write_bytes(original)
+            foreign_inode["value"] = manifest.lstat().st_ino
+
+        with patch(
+            "tools.skills_sync._file_publish_barrier",
+            side_effect=replace_before_move,
+        ):
+            with pytest.raises(OSError, match="changed concurrently"):
+                _write_manifest(
+                    {"skill": "new-hash"},
+                    manifest,
+                    expected_bytes=original,
+                    expected_identity=expected_identity,
+                )
+
+        assert manifest.read_bytes() == original
+        assert manifest.lstat().st_ino == foreign_inode["value"]
 
 
 class TestDirHash:
@@ -520,6 +619,361 @@ class TestSyncSkills:
         assert entry["trust_level"] == "builtin"
         assert entry["install_path"] == "mlops/training/trl-fine-tuning"
 
+    def test_description_publish_does_not_clobber_concurrent_foreign_file(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        destination = skills_dir / "category" / "DESCRIPTION.md"
+        foreign_inode = {}
+
+        def claim_destination(_source, dest):
+            if dest != destination:
+                return
+            destination.write_text("foreign concurrent description")
+            foreign_inode["value"] = destination.lstat().st_ino
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch(
+                "tools.skills_sync._description_publish_barrier",
+                side_effect=claim_destination,
+            ):
+                sync_skills(quiet=True)
+
+        assert destination.read_text() == "foreign concurrent description"
+        assert destination.lstat().st_ino == foreign_inode["value"]
+
+    def test_description_nofollow_open_rejects_symlink_swapped_in_before_read(
+        self, tmp_path
+    ):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        source_description = bundled / "category" / "DESCRIPTION.md"
+        destination = skills_dir / "category" / "DESCRIPTION.md"
+        external = tmp_path / "external-description-secret"
+        external.write_text("must never be copied")
+
+        def replace_source_before_open(source):
+            if source != source_description:
+                return
+            source.unlink()
+            source.symlink_to(external)
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch(
+                "tools.skills_sync._description_source_open_barrier",
+                side_effect=replace_source_before_open,
+            ):
+                sync_skills(quiet=True)
+
+        assert not destination.exists()
+        retained = list(destination.parent.glob(".DESCRIPTION.md.publish-retained-*"))
+        assert all(path.read_bytes() != external.read_bytes() for path in retained)
+
+    def test_description_stage_mutation_before_publish_is_retracted(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        destination = skills_dir / "category" / "DESCRIPTION.md"
+
+        def mutate_stage(_source, dest):
+            if dest != destination:
+                return
+            stages = list(dest.parent.glob(".DESCRIPTION.md.publish-retained-*"))
+            assert len(stages) == 1
+            stages[0].write_text("foreign stage mutation")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch(
+                "tools.skills_sync._description_publish_barrier",
+                side_effect=mutate_stage,
+            ):
+                sync_skills(quiet=True)
+
+        assert not destination.exists()
+        rejected = list(
+            destination.parent.glob(".DESCRIPTION.md.publish-rejected-retained-*")
+        )
+        assert rejected
+        assert rejected[0].read_text() == "foreign stage mutation"
+
+    def test_description_stage_root_replacement_is_quarantined_never_restored_live(
+        self, tmp_path
+    ):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        destination = skills_dir / "category" / "DESCRIPTION.md"
+        replacement_inode = {}
+
+        def replace_stage_root(_source, dest):
+            if dest != destination:
+                return
+            stages = list(dest.parent.glob(".DESCRIPTION.md.publish-retained-*"))
+            assert len(stages) == 1
+            stages[0].unlink()
+            stages[0].write_text("foreign replacement inode")
+            replacement_inode["value"] = stages[0].lstat().st_ino
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch(
+                "tools.skills_sync._description_publish_barrier",
+                side_effect=replace_stage_root,
+            ):
+                sync_skills(quiet=True)
+
+        assert not destination.exists()
+        rejected = list(
+            destination.parent.glob(".DESCRIPTION.md.prepublish-rejected-retained-*")
+        )
+        assert len(rejected) == 1
+        assert rejected[0].lstat().st_ino == replacement_inode["value"]
+        assert rejected[0].read_text() == "foreign replacement inode"
+
+    def test_description_stage_root_replaced_inside_rename_is_quarantined(
+        self, tmp_path
+    ):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        destination = skills_dir / "category" / "DESCRIPTION.md"
+        real_rename = skills_sync_module._rename_noreplace
+        replacement_inode = {}
+        injected = {"done": False}
+
+        def replace_inside_rename(source, dest):
+            source = Path(source)
+            dest = Path(dest)
+            if dest == destination and not injected["done"]:
+                injected["done"] = True
+                source.unlink()
+                source.write_text("foreign inside rename")
+                replacement_inode["value"] = source.lstat().st_ino
+            return real_rename(source, dest)
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch(
+                "tools.skills_sync._rename_noreplace",
+                side_effect=replace_inside_rename,
+            ):
+                sync_skills(quiet=True)
+
+        assert not destination.exists()
+        rejected = list(
+            destination.parent.glob(".DESCRIPTION.md.publish-rejected-retained-*")
+        )
+        assert len(rejected) == 1
+        assert rejected[0].lstat().st_ino == replacement_inode["value"]
+
+    def test_stage_revalidation_rejects_source_symlink_escape_created_after_copy(
+        self, tmp_path
+    ):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        destination = skills_dir / "category" / "new-skill"
+        external = tmp_path / "external-secret"
+        external.write_text("must not publish")
+
+        def mutate_private_stage(stage, dest):
+            if dest != destination:
+                return
+            staged_skill = stage / "SKILL.md"
+            staged_skill.unlink()
+            staged_skill.symlink_to(external)
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch(
+                "tools.skills_sync._stage_validation_barrier",
+                side_effect=mutate_private_stage,
+            ):
+                with pytest.raises(OSError, match="staged source changed"):
+                    sync_skills(quiet=True)
+
+        assert not destination.exists()
+        assert not manifest_file.exists()
+
+    def test_post_rename_revalidation_retracts_stage_mutated_immediately_before_publish(
+        self, tmp_path
+    ):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        destination = skills_dir / "category" / "new-skill"
+        external = tmp_path / "external-secret-after-validation"
+        external.write_text("must not become live")
+
+        def mutate_after_validation(stage, dest):
+            if dest != destination:
+                return
+            staged_skill = stage / "SKILL.md"
+            staged_skill.unlink()
+            staged_skill.symlink_to(external)
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch(
+                "tools.skills_sync._stage_publish_barrier",
+                side_effect=mutate_after_validation,
+            ):
+                with pytest.raises(OSError, match="published stage changed"):
+                    sync_skills(quiet=True)
+
+        assert not destination.exists()
+        assert not manifest_file.exists()
+        quarantines = list(
+            destination.parent.glob(".new-skill.publish-rejected-retained-*")
+        )
+        assert quarantines
+        assert quarantines[0].is_dir()
+
+    def test_skill_stage_root_replacement_is_quarantined_never_restored_live(
+        self, tmp_path
+    ):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        destination = skills_dir / "category" / "new-skill"
+        replacement_inode = {}
+
+        def replace_stage_root(stage, dest):
+            if dest != destination:
+                return
+            shutil.rmtree(stage)
+            stage.mkdir()
+            (stage / "SKILL.md").write_text("foreign replacement root")
+            replacement_inode["value"] = stage.lstat().st_ino
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch(
+                "tools.skills_sync._stage_publish_barrier",
+                side_effect=replace_stage_root,
+            ):
+                with pytest.raises(OSError, match="published stage changed"):
+                    sync_skills(quiet=True)
+
+        assert not destination.exists()
+        rejected = list(
+            destination.parent.glob(".new-skill.prepublish-rejected-retained-*")
+        )
+        assert len(rejected) == 1
+        assert rejected[0].lstat().st_ino == replacement_inode["value"]
+        assert (rejected[0] / "SKILL.md").read_text() == "foreign replacement root"
+        assert not manifest_file.exists()
+
+    def test_skill_stage_root_replaced_inside_rename_is_quarantined(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        destination = skills_dir / "category" / "new-skill"
+        real_rename = skills_sync_module._rename_noreplace
+        replacement_inode = {}
+        injected = {"done": False}
+
+        def replace_inside_rename(source, dest):
+            source = Path(source)
+            dest = Path(dest)
+            if dest == destination and not injected["done"]:
+                injected["done"] = True
+                shutil.rmtree(source)
+                source.mkdir()
+                (source / "SKILL.md").write_text("foreign inside rename")
+                replacement_inode["value"] = source.lstat().st_ino
+            return real_rename(source, dest)
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch(
+                "tools.skills_sync._rename_noreplace",
+                side_effect=replace_inside_rename,
+            ):
+                with pytest.raises(OSError, match="published stage changed"):
+                    sync_skills(quiet=True)
+
+        assert not destination.exists()
+        rejected = list(
+            destination.parent.glob(".new-skill.publish-rejected-retained-*")
+        )
+        assert len(rejected) == 1
+        assert rejected[0].lstat().st_ino == replacement_inode["value"]
+        assert not manifest_file.exists()
+
+    def test_quarantine_restores_replacement_raced_after_published_inode_observation(
+        self, tmp_path
+    ):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        destination = skills_dir / "category" / "new-skill"
+        external = tmp_path / "external"
+        external.write_text("trigger invalid published content")
+        foreign_inode = {}
+
+        def mutate_stage_content(stage, dest):
+            if dest != destination:
+                return
+            (stage / "SKILL.md").unlink()
+            (stage / "SKILL.md").symlink_to(external)
+
+        def replace_after_observation(path):
+            if path != destination:
+                return
+            shutil.rmtree(destination)
+            destination.mkdir()
+            (destination / "SKILL.md").write_text("independent live replacement")
+            foreign_inode["value"] = destination.lstat().st_ino
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch(
+                "tools.skills_sync._stage_publish_barrier",
+                side_effect=mutate_stage_content,
+            ), patch(
+                "tools.skills_sync._conditional_quarantine_barrier",
+                side_effect=replace_after_observation,
+            ):
+                with pytest.raises(OSError, match="published stage changed"):
+                    sync_skills(quiet=True)
+
+        assert destination.lstat().st_ino == foreign_inode["value"]
+        assert (destination / "SKILL.md").read_text() == "independent live replacement"
+
+    def test_hub_lock_backfill_preserves_replacement_between_cas_check_and_publish(
+        self, tmp_path
+    ):
+        bundled = self._setup_bundled(tmp_path)
+        optional = tmp_path / "optional-skills"
+        optional_skill = optional / "mlops" / "training" / "trl-fine-tuning"
+        optional_skill.mkdir(parents=True)
+        (optional_skill / "SKILL.md").write_text("# official\n")
+
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        active = skills_dir / "mlops" / "training" / "trl-fine-tuning"
+        active.mkdir(parents=True)
+        (active / "SKILL.md").write_text("# official\n")
+        lock_path = skills_dir / ".hub" / "lock.json"
+        lock_path.parent.mkdir(parents=True)
+        original = b'{"version": 1, "installed": {}}\n'
+        lock_path.write_bytes(original)
+        foreign_inode = {}
+
+        def replace_lock_after_check(path):
+            if path != lock_path:
+                return
+            lock_path.unlink()
+            lock_path.write_bytes(original)
+            foreign_inode["value"] = lock_path.lstat().st_ino
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch("tools.skills_sync._get_optional_dir", return_value=optional):
+                with patch(
+                    "tools.skills_sync._file_publish_barrier",
+                    side_effect=replace_lock_after_check,
+                ):
+                    with pytest.raises(OSError, match="changed concurrently"):
+                        sync_skills(quiet=True)
+
+        assert lock_path.read_bytes() == original
+        assert lock_path.lstat().st_ino == foreign_inode["value"]
+
     def test_does_not_backfill_optional_provenance_for_modified_skill(self, tmp_path):
         bundled = self._setup_bundled(tmp_path)
         optional = tmp_path / "optional-skills"
@@ -603,6 +1057,7 @@ class TestSyncSkills:
             "copied": [], "updated": [], "skipped": 0,
             "user_modified": [], "cleaned": [], "removed": 0,
             "rejected": [], "validation_errors": [],
+            "copy_errors": [],
             "total_bundled": 0, "optional_provenance_backfilled": [],
         }
 
@@ -629,6 +1084,9 @@ class TestSyncSkills:
 
             # new-skill should NOT be in copied (it failed)
             assert "new-skill" not in result["copied"]
+            assert result["copy_errors"] == [
+                {"skill": "new-skill", "operation": "copy", "error": "Simulated disk full"}
+            ]
 
             # Critical: new-skill must NOT be in the manifest
             manifest = _read_manifest()
@@ -675,6 +1133,326 @@ class TestSyncSkills:
             assert user_skill.exists(), (
                 "Update failure destroyed user's skill copy without replacing it"
             )
+
+    def test_partial_update_failure_restores_original_copy(self, tmp_path):
+        """A copy that creates a partial destination before failing is rolled back."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        user_skill = skills_dir / "old-skill"
+        user_skill.mkdir(parents=True)
+        (user_skill / "SKILL.md").write_text("# Old v1")
+        (user_skill / "keep.txt").write_text("original")
+        old_hash = _dir_hash(user_skill)
+        manifest_file.write_text(f"old-skill:{old_hash}\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            original_copytree = __import__("shutil").copytree
+
+            def partially_failing_copytree(src, dst, *args, **kwargs):
+                if Path(src).name == "old-skill":
+                    Path(dst).mkdir(parents=True)
+                    (Path(dst) / "partial.txt").write_text("partial")
+                    raise OSError("Simulated partial copy")
+                return original_copytree(src, dst, *args, **kwargs)
+
+            with patch("shutil.copytree", side_effect=partially_failing_copytree):
+                result = sync_skills(quiet=True)
+
+        assert (user_skill / "SKILL.md").read_text() == "# Old v1"
+        assert (user_skill / "keep.txt").read_text() == "original"
+        assert not (user_skill / "partial.txt").exists()
+        assert not user_skill.with_suffix(".bak").exists()
+        assert result["copy_errors"] == [
+            {"skill": "old-skill", "operation": "update", "error": "Simulated partial copy"}
+        ]
+
+    def test_hash_failure_aborts_before_any_live_target_mutation(self, tmp_path):
+        bundled = tmp_path / "bundled"
+        first = bundled / "first"
+        failing = bundled / "failing"
+        first.mkdir(parents=True)
+        failing.mkdir(parents=True)
+        (first / "SKILL.md").write_text("---\nname: first\n---\n")
+        (failing / "SKILL.md").write_text("---\nname: failing\n---\n")
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".workspace_manifest"
+        original_hash = _dir_hash
+
+        def fail_second_hash(path: Path) -> str:
+            if path == failing:
+                raise OSError("source unreadable")
+            return original_hash(path)
+
+        with patch(
+            "tools.skills_sync._discover_bundled_skills",
+            return_value=[("first", first), ("failing", failing)],
+        ), patch("tools.skills_sync._dir_hash", side_effect=fail_second_hash):
+            with pytest.raises(OSError, match="source unreadable"):
+                sync_skills(
+                    quiet=True,
+                    source_dir=bundled,
+                    target_dir=skills_dir,
+                    manifest_file=manifest_file,
+                )
+
+        assert not (skills_dir / "first").exists()
+        assert not (skills_dir / "failing").exists()
+        assert not manifest_file.exists()
+
+    def test_manifest_write_failure_rolls_back_all_live_changes(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".workspace_manifest"
+        old_skill = skills_dir / "old-skill"
+        old_skill.mkdir(parents=True)
+        (old_skill / "SKILL.md").write_text("# Old v1")
+        old_hash = _dir_hash(old_skill)
+        manifest_file.write_text(f"old-skill:{old_hash}\n")
+        original_manifest = manifest_file.read_bytes()
+
+        with patch(
+            "tools.skills_sync._manifest_commit_barrier",
+            side_effect=OSError("manifest denied"),
+        ):
+            with pytest.raises(OSError, match="manifest denied"):
+                sync_skills(
+                    quiet=True,
+                    source_dir=bundled,
+                    target_dir=skills_dir,
+                    manifest_file=manifest_file,
+                )
+
+        assert (old_skill / "SKILL.md").read_text() == "# Old v1"
+        assert not (skills_dir / "category" / "new-skill").exists()
+        assert manifest_file.read_bytes() == original_manifest
+
+    def test_stale_backup_is_never_used_for_rollback(self, tmp_path):
+        source = tmp_path / "source"
+        dest = tmp_path / "skill"
+        stale = tmp_path / ".skill.sync-backup"
+        source.mkdir()
+        dest.mkdir()
+        stale.mkdir()
+        (source / "value.txt").write_text("new")
+        (dest / "value.txt").write_text("current")
+        (stale / "value.txt").write_text("stale")
+
+        _copy_skill_tree_atomic(source, dest)
+
+        assert (dest / "value.txt").read_text() == "new"
+        assert (stale / "value.txt").read_text() == "stale"
+
+    def test_fresh_install_race_preserves_target_created_after_preflight(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".workspace_manifest"
+        raced = skills_dir / "category" / "new-skill"
+        original_copytree = shutil.copytree
+
+        def race_after_stage(src, dst, *args, **kwargs):
+            result = original_copytree(src, dst, *args, **kwargs)
+            if Path(src).name == "new-skill":
+                raced.mkdir(parents=True)
+                (raced / "SKILL.md").write_text("foreign-race")
+            return result
+
+        with patch("shutil.copytree", side_effect=race_after_stage):
+            with pytest.raises(OSError, match="destination changed after preflight"):
+                sync_skills(
+                    quiet=True,
+                    source_dir=bundled,
+                    target_dir=skills_dir,
+                    manifest_file=manifest_file,
+                )
+
+        assert (raced / "SKILL.md").read_text() == "foreign-race"
+        assert not manifest_file.exists()
+
+    def test_update_race_preserves_edit_made_after_preflight(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".workspace_manifest"
+        sync_skills(
+            quiet=True,
+            source_dir=bundled,
+            target_dir=skills_dir,
+            manifest_file=manifest_file,
+        )
+        installed = skills_dir / "old-skill"
+        original_manifest = manifest_file.read_bytes()
+        (bundled / "old-skill" / "SKILL.md").write_text("# New upstream")
+        original_copytree = shutil.copytree
+
+        def edit_after_stage(src, dst, *args, **kwargs):
+            result = original_copytree(src, dst, *args, **kwargs)
+            if Path(src).name == "old-skill":
+                (installed / "SKILL.md").write_text("user-race")
+            return result
+
+        with patch("shutil.copytree", side_effect=edit_after_stage):
+            with pytest.raises(OSError, match="destination changed after preflight"):
+                sync_skills(
+                    quiet=True,
+                    source_dir=bundled,
+                    target_dir=skills_dir,
+                    manifest_file=manifest_file,
+                )
+
+        assert (installed / "SKILL.md").read_text() == "user-race"
+        assert manifest_file.read_bytes() == original_manifest
+
+    def test_fresh_install_final_rename_preserves_empty_concurrent_claim(self, tmp_path):
+        source = tmp_path / "source"
+        destination = tmp_path / "destination"
+        source.mkdir()
+        (source / "SKILL.md").write_text("source")
+        real_rename = skills_sync_module._rename_noreplace
+
+        def claim_immediately_before_rename(staged, dest):
+            if Path(dest) == destination:
+                destination.mkdir()
+            return real_rename(Path(staged), Path(dest))
+
+        with patch(
+            "tools.skills_sync._rename_noreplace",
+            side_effect=claim_immediately_before_rename,
+        ):
+            with pytest.raises(OSError, match="destination changed after preflight"):
+                _copy_skill_tree_atomic(source, destination, expected_absent=True)
+
+        assert destination.is_dir()
+        assert list(destination.iterdir()) == []
+
+    def test_update_final_rename_preserves_foreign_concurrent_claim(self, tmp_path):
+        source = tmp_path / "source"
+        destination = tmp_path / "destination"
+        source.mkdir()
+        destination.mkdir()
+        (source / "SKILL.md").write_text("new")
+        (destination / "SKILL.md").write_text("old")
+        expected_hash = _dir_hash(destination)
+        real_rename = skills_sync_module._rename_noreplace
+
+        def claim_immediately_before_stage_rename(staged, dest):
+            staged = Path(staged)
+            dest = Path(dest)
+            if ".sync-stage-" in staged.name and dest == destination:
+                destination.mkdir()
+                (destination / "SKILL.md").write_text("foreign")
+            return real_rename(staged, dest)
+
+        with patch(
+            "tools.skills_sync._rename_noreplace",
+            side_effect=claim_immediately_before_stage_rename,
+        ):
+            with pytest.raises(OSError, match="destination changed after preflight"):
+                _copy_skill_tree_atomic(
+                    source,
+                    destination,
+                    expected_hash=expected_hash,
+                    retain_backup=True,
+                )
+
+        assert (destination / "SKILL.md").read_text() == "foreign"
+        backups = list(tmp_path.glob(".destination.sync-backup-*"))
+        assert len(backups) == 1
+        assert (backups[0] / "SKILL.md").read_text() == "old"
+
+    def test_manifest_failure_rollback_preserves_replaced_live_target(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".workspace_manifest"
+        raced = skills_dir / "category" / "new-skill"
+
+        def replace_then_fail(*_args, **_kwargs):
+            shutil.rmtree(raced)
+            raced.mkdir()
+            (raced / "SKILL.md").write_text("foreign-after-install")
+            raise OSError("manifest write failed")
+
+        with patch("tools.skills_sync._write_manifest", side_effect=replace_then_fail):
+            with pytest.raises(OSError, match="manifest write failed"):
+                sync_skills(
+                    quiet=True,
+                    source_dir=bundled,
+                    target_dir=skills_dir,
+                    manifest_file=manifest_file,
+                )
+
+        assert (raced / "SKILL.md").read_text() == "foreign-after-install"
+
+    def test_manifest_failure_preserves_same_bytes_replacement_with_new_inode(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".workspace_manifest"
+        raced = skills_dir / "category" / "new-skill"
+
+        def replace_with_same_bytes_then_fail(*_args, **_kwargs):
+            original_inode = raced.lstat().st_ino
+            replacement = tmp_path / "same-bytes-replacement"
+            shutil.copytree(raced, replacement)
+            shutil.rmtree(raced)
+            shutil.move(str(replacement), str(raced))
+            assert raced.lstat().st_ino != original_inode
+            raise OSError("manifest write failed")
+
+        with patch(
+            "tools.skills_sync._write_manifest",
+            side_effect=replace_with_same_bytes_then_fail,
+        ):
+            with pytest.raises(OSError, match="manifest write failed"):
+                sync_skills(
+                    quiet=True,
+                    source_dir=bundled,
+                    target_dir=skills_dir,
+                    manifest_file=manifest_file,
+                )
+
+        assert raced.exists()
+        assert (raced / "SKILL.md").read_text() == "# New"
+
+    def test_discard_phase_retains_backup_instead_of_unlinking_raced_path(self, tmp_path):
+        destination = tmp_path / "skill"
+        backup = tmp_path / ".skill.sync-backup-owned"
+        backup.mkdir()
+        (backup / "SKILL.md").write_text("same bytes")
+        original_inode = backup.lstat().st_ino
+        replacement = tmp_path / "replacement"
+        shutil.copytree(backup, replacement)
+        shutil.rmtree(backup)
+        shutil.move(str(replacement), str(backup))
+        assert backup.lstat().st_ino != original_inode
+
+        skills_sync_module._discard_live_backups([(destination, backup, None)])
+
+        assert (backup / "SKILL.md").read_text() == "same bytes"
+
+    def test_runtime_junk_is_not_hashed_or_copied(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        skill = bundled / "old-skill"
+        (skill / "__pycache__").mkdir()
+        (skill / "__pycache__" / "module.pyc").write_bytes(b"compiled")
+        (skill / ".DS_Store").write_bytes(b"finder")
+        (skill / "node_modules" / "pkg").mkdir(parents=True)
+        (skill / "node_modules" / "pkg" / "index.js").write_text("generated")
+
+        clean = tmp_path / "clean"
+        clean.mkdir()
+        (clean / "SKILL.md").write_text("# Old")
+        assert _dir_hash(skill) == _dir_hash(clean)
+
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        dest = skills_dir / "old-skill"
+        assert "old-skill" in result["copied"]
+        assert not (dest / "__pycache__").exists()
+        assert not (dest / ".DS_Store").exists()
+        assert not (dest / "node_modules").exists()
 
     def test_update_records_new_origin_hash(self, tmp_path):
         """After updating a skill, the manifest should record the new bundled hash."""
@@ -731,6 +1509,20 @@ class TestSyncSkillsWorkspaceSource:
         assert (target / "writing" / "copy-polish" / "SKILL.md").exists()
         manifest = _read_manifest(manifest_file)
         assert set(manifest) == {"daily-brief", "copy-polish"}
+
+    def test_workspace_source_does_not_mutate_optional_hub_provenance(self, tmp_path):
+        source = self._setup_workspace_source(tmp_path)
+        target = tmp_path / "hermes_skills"
+
+        with patch("tools.skills_sync._backfill_optional_provenance") as backfill:
+            sync_skills(
+                quiet=True,
+                source_dir=source,
+                target_dir=target,
+                manifest_file=target / ".workspace_manifest",
+            )
+
+        backfill.assert_not_called()
 
 
 class TestSyncSkillsSeparateManifest:
@@ -811,6 +1603,146 @@ class TestSyncSkillsRemoveDeleted:
         assert "cleanup" in result["cleaned"]
         assert not (target / "ops" / "cleanup").exists()
         assert "cleanup" not in _read_manifest(manifest_file)
+
+    def test_remove_deleted_restores_foreign_replacement_raced_after_hash_check(
+        self, tmp_path
+    ):
+        source = self._setup_source(tmp_path)
+        target = tmp_path / "hermes_skills"
+        manifest_file = target / ".workspace_manifest"
+        sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+        )
+        installed = target / "ops" / "cleanup"
+        shutil.rmtree(source / "ops" / "cleanup")
+        original_manifest = manifest_file.read_bytes()
+        foreign_inode = {}
+
+        def replace_after_hash_check(dest):
+            if dest != installed:
+                return
+            shutil.rmtree(installed)
+            installed.mkdir()
+            (installed / "SKILL.md").write_text("# foreign raced version\n")
+            foreign_inode["value"] = installed.lstat().st_ino
+
+        with patch(
+            "tools.skills_sync._delete_move_barrier",
+            side_effect=replace_after_hash_check,
+        ):
+            with pytest.raises(OSError, match="stale target changed after ownership check"):
+                sync_skills(
+                    quiet=True,
+                    source_dir=source,
+                    target_dir=target,
+                    manifest_file=manifest_file,
+                    remove_deleted=True,
+                )
+
+        assert (installed / "SKILL.md").read_text() == "# foreign raced version\n"
+        assert installed.lstat().st_ino == foreign_inode["value"]
+        assert manifest_file.read_bytes() == original_manifest
+        assert "cleanup" in _read_manifest(manifest_file)
+
+    def test_remove_deleted_never_uses_same_name_in_foreign_category(self, tmp_path):
+        source = self._setup_source(tmp_path)
+        target = tmp_path / "hermes_skills"
+        manifest_file = target / ".workspace_manifest"
+        sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+        )
+        shutil.rmtree(target / "ops" / "cleanup")
+        foreign = target / "foreign" / "cleanup"
+        foreign.mkdir(parents=True)
+        (foreign / "SKILL.md").write_text("---\nname: cleanup\n---\n# Foreign\n")
+        shutil.rmtree(source / "ops" / "cleanup")
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+            remove_deleted=True,
+        )
+
+        assert result["removed"] == 0
+        assert (foreign / "SKILL.md").read_text().endswith("# Foreign\n")
+        assert "cleanup" not in _read_manifest(manifest_file)
+
+    def test_legacy_manifest_without_provenance_keeps_ambiguous_foreign_skill(self, tmp_path):
+        source = tmp_path / "workspace_skills"
+        source.mkdir()
+        target = tmp_path / "hermes_skills"
+        foreign = target / "foreign" / "cleanup"
+        foreign.mkdir(parents=True)
+        (foreign / "SKILL.md").write_text("---\nname: cleanup\n---\n# Foreign\n")
+        manifest_file = target / ".workspace_manifest"
+        manifest_file.write_text("cleanup:legacy-hash\n")
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+            remove_deleted=True,
+        )
+
+        assert result["removed"] == 0
+        assert (foreign / "SKILL.md").exists()
+        assert _read_manifest(manifest_file) == {"cleanup": "legacy-hash"}
+
+    def test_manifest_records_install_path_and_source_provenance(self, tmp_path):
+        source = self._setup_source(tmp_path)
+        target = tmp_path / "hermes_skills"
+        manifest_file = target / ".workspace_manifest"
+
+        sync_skills(
+            quiet=True,
+            source_dir=source,
+            target_dir=target,
+            manifest_file=manifest_file,
+        )
+
+        name, raw_record = manifest_file.read_text().strip().split(":", 1)
+        record = json.loads(raw_record)
+        assert name == "cleanup"
+        assert record["install_path"] == "ops/cleanup"
+        assert record["provenance"] == {
+            "kind": "workspace",
+            "source_root": str(source.resolve()),
+        }
+
+    def test_remove_deleted_rejects_manifest_from_different_source_root(self, tmp_path):
+        source_a = self._setup_source(tmp_path)
+        source_b = tmp_path / "different_workspace_skills"
+        source_b.mkdir()
+        target = tmp_path / "hermes_skills"
+        manifest_file = target / ".workspace_manifest"
+        sync_skills(
+            quiet=True,
+            source_dir=source_a,
+            target_dir=target,
+            manifest_file=manifest_file,
+        )
+        shutil.rmtree(source_a / "ops" / "cleanup")
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=source_b,
+            target_dir=target,
+            manifest_file=manifest_file,
+            remove_deleted=True,
+        )
+
+        assert result["removed"] == 0
+        assert (target / "ops" / "cleanup" / "SKILL.md").exists()
+        assert "cleanup" in _read_manifest(manifest_file)
 
 
 class TestSyncSkillsManifestProtection:
@@ -951,6 +1883,40 @@ class TestResetBundledSkill:
         # SKILL.md should be the bundled content
         assert "GW v2 (upstream)" in (dest / "SKILL.md").read_text()
 
+    def test_reset_restore_preserves_replacement_raced_after_ownership_check(
+        self, tmp_path
+    ):
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        dest = skills_dir / "productivity" / "google-workspace"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("# original user copy\n")
+        manifest_file.write_text(
+            "google-workspace:STALEHASH000000000000000000000000\n"
+        )
+        foreign_inode = {}
+
+        def replace_after_snapshot(destination):
+            if destination != dest:
+                return
+            shutil.rmtree(dest)
+            dest.mkdir()
+            (dest / "SKILL.md").write_text("# concurrent foreign replacement\n")
+            foreign_inode["value"] = dest.lstat().st_ino
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch(
+                "tools.skills_sync._reset_remove_barrier",
+                side_effect=replace_after_snapshot,
+            ):
+                result = reset_bundled_skill("google-workspace", restore=True)
+
+        assert result["ok"] is False
+        assert "changed after ownership check" in result["message"]
+        assert (dest / "SKILL.md").read_text() == "# concurrent foreign replacement\n"
+        assert dest.lstat().st_ino == foreign_inode["value"]
+
     def test_reset_nonexistent_skill_errors_gracefully(self, tmp_path):
         """Resetting a skill that's neither bundled nor in the manifest returns a clear error."""
         bundled = self._setup_bundled(tmp_path)
@@ -1075,8 +2041,36 @@ class TestSymlinkEscapeRejection:
             if path.is_file():
                 assert "OUTSIDE-DATA-LEAK" not in path.read_text(errors="ignore")
 
-    def test_skill_with_internal_symlink_is_accepted(self, tmp_path):
-        """Symlinks that stay inside the workspace should be allowed (not escape)."""
+    def test_rejected_skill_is_not_treated_as_deleted(self, tmp_path):
+        workspace, skill = self._setup_workspace(tmp_path)
+        skills_dir = tmp_path / "target"
+        manifest = skills_dir / ".workspace_manifest"
+        sync_skills(
+            quiet=True,
+            source_dir=workspace,
+            target_dir=skills_dir,
+            manifest_file=manifest,
+        )
+        installed = skills_dir / "ops" / "safe-skill"
+        original = (installed / "SKILL.md").read_text()
+        secret = tmp_path / "outside-secret"
+        secret.write_text("outside")
+        (skill / "leaked.txt").symlink_to(secret)
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=workspace,
+            target_dir=skills_dir,
+            manifest_file=manifest,
+            remove_deleted=True,
+        )
+
+        assert "safe-skill" in result["rejected"]
+        assert result["removed"] == 0
+        assert (installed / "SKILL.md").read_text() == original
+
+    def test_skill_symlink_to_workspace_sibling_is_rejected_from_live_publish(self, tmp_path):
+        """A live skill may only retain links inside its own installed tree."""
         workspace, skill = self._setup_workspace(tmp_path)
         # Internal sibling target inside workspace
         internal = workspace / "ops" / "shared-asset.txt"
@@ -1086,14 +2080,215 @@ class TestSymlinkEscapeRejection:
         skills_dir = tmp_path / "target"
         manifest = skills_dir / ".bundled_manifest"
 
-        result = sync_skills(
-            quiet=True, source_dir=workspace, target_dir=skills_dir,
+        with pytest.raises(OSError, match="staged source changed"):
+            sync_skills(
+                quiet=True, source_dir=workspace, target_dir=skills_dir,
+                manifest_file=manifest,
+            )
+        assert not (skills_dir / "ops" / "safe-skill").exists()
+        assert not manifest.exists()
+
+    def test_second_sync_quarantines_legacy_live_link_after_source_target_escapes(
+        self, tmp_path
+    ):
+        workspace, skill = self._setup_workspace(tmp_path)
+        internal = workspace / "ops" / "shared-asset.txt"
+        internal.write_text("shared")
+        (skill / "asset.txt").symlink_to(internal)
+        skills_dir = tmp_path / "target"
+        manifest = skills_dir / ".workspace_manifest"
+
+        # Reproduce a live tree created by the former source-root exception.
+        with patch("tools.skills_sync._staged_tree_safe", return_value=True):
+            first = sync_skills(
+                quiet=True,
+                source_dir=workspace,
+                target_dir=skills_dir,
+                manifest_file=manifest,
+            )
+        assert first["copied"] == ["safe-skill"]
+        installed = skills_dir / "ops" / "safe-skill"
+        assert (installed / "asset.txt").is_symlink()
+        legacy_hash = _read_manifest(manifest)["safe-skill"]
+        manifest.write_text(f"safe-skill:{legacy_hash}\n")
+        same_name_foreign = skills_dir / "foreign" / "safe-skill"
+        same_name_foreign.mkdir(parents=True)
+        (same_name_foreign / "SKILL.md").write_text("foreign same-name skill")
+
+        outside = tmp_path / "outside-secret"
+        outside.write_text("outside")
+        internal.unlink()
+        internal.symlink_to(outside)
+
+        second = sync_skills(
+            quiet=True,
+            source_dir=workspace,
+            target_dir=skills_dir,
             manifest_file=manifest,
         )
-        assert "safe-skill" in result["copied"]
-        assert (skills_dir / "ops" / "safe-skill" / "SKILL.md").exists()
-        # symlink preserved (not dereferenced) — points at original
-        assert (skills_dir / "ops" / "safe-skill" / "asset.txt").is_symlink()
+
+        assert second["rejected"] == ["safe-skill"]
+        assert second["removed"] == 1
+        assert second["cleaned"] == ["safe-skill"]
+        assert not installed.exists()
+        assert "safe-skill" not in _read_manifest(manifest)
+        quarantines = list(
+            installed.parent.glob(".safe-skill.unsafe-live-retained-*")
+        )
+        assert len(quarantines) == 1
+        assert (quarantines[0] / "asset.txt").is_symlink()
+        assert (same_name_foreign / "SKILL.md").read_text() == "foreign same-name skill"
+
+    def test_safe_hash_identical_v2_target_migrates_to_v3_provenance(self, tmp_path):
+        workspace, skill = self._setup_workspace(tmp_path)
+        skills_dir = tmp_path / "target"
+        installed = skills_dir / "ops" / "safe-skill"
+        shutil.copytree(skill, installed)
+        manifest = skills_dir / ".workspace_manifest"
+        legacy_hash = _dir_hash(installed)
+        manifest.write_text(f"safe-skill:{legacy_hash}\n")
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=workspace,
+            target_dir=skills_dir,
+            manifest_file=manifest,
+        )
+
+        assert result["skipped"] == 1
+        record = skills_sync_module._read_manifest_records(manifest)["safe-skill"]
+        assert record["hash"] == legacy_hash
+        assert record["install_path"] == "ops/safe-skill"
+        assert record["provenance"] == {
+            "kind": "workspace",
+            "source_root": str(workspace.resolve()),
+        }
+
+    def test_already_unsafe_v2_canonical_target_is_quarantined_not_executable(
+        self, tmp_path
+    ):
+        workspace, skill = self._setup_workspace(tmp_path)
+        outside = tmp_path / "outside-secret"
+        outside.write_text("outside")
+        (skill / "escape.txt").symlink_to(outside)
+        skills_dir = tmp_path / "target"
+        installed = skills_dir / "ops" / "safe-skill"
+        installed.mkdir(parents=True)
+        (installed / "SKILL.md").write_text("legacy installed")
+        (installed / "escape.txt").symlink_to(outside)
+        manifest = skills_dir / ".workspace_manifest"
+        manifest.write_text("safe-skill:legacy-owned-hash\n")
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=workspace,
+            target_dir=skills_dir,
+            manifest_file=manifest,
+        )
+
+        assert result["rejected"] == ["safe-skill"]
+        assert result["removed"] == 1
+        assert not installed.exists()
+        assert "safe-skill" not in _read_manifest(manifest)
+        quarantines = list(
+            installed.parent.glob(".safe-skill.unsafe-live-retained-*")
+        )
+        assert len(quarantines) == 1
+        assert (quarantines[0] / "escape.txt").is_symlink()
+
+    def test_unsafe_live_quarantine_restores_foreign_replacement_raced_after_snapshot(
+        self, tmp_path
+    ):
+        workspace, skill = self._setup_workspace(tmp_path)
+        internal = workspace / "ops" / "shared-asset.txt"
+        internal.write_text("shared")
+        (skill / "asset.txt").symlink_to(internal)
+        skills_dir = tmp_path / "target"
+        manifest = skills_dir / ".workspace_manifest"
+        with patch("tools.skills_sync._staged_tree_safe", return_value=True):
+            sync_skills(
+                quiet=True,
+                source_dir=workspace,
+                target_dir=skills_dir,
+                manifest_file=manifest,
+            )
+        installed = skills_dir / "ops" / "safe-skill"
+        outside = tmp_path / "outside-secret"
+        outside.write_text("outside")
+        internal.unlink()
+        internal.symlink_to(outside)
+        foreign_inode = {}
+
+        def replace_after_snapshot(path):
+            if path != installed:
+                return
+            shutil.rmtree(installed)
+            installed.mkdir()
+            (installed / "SKILL.md").write_text("foreign raced live tree")
+            foreign_inode["value"] = installed.lstat().st_ino
+
+        with patch(
+            "tools.skills_sync._unsafe_live_quarantine_barrier",
+            side_effect=replace_after_snapshot,
+        ):
+            second = sync_skills(
+                quiet=True,
+                source_dir=workspace,
+                target_dir=skills_dir,
+                manifest_file=manifest,
+            )
+
+        assert second["removed"] == 0
+        assert installed.lstat().st_ino == foreign_inode["value"]
+        assert (installed / "SKILL.md").read_text() == "foreign raced live tree"
+        assert "safe-skill" in _read_manifest(manifest)
+
+    @pytest.mark.parametrize("malicious_kind", ["absolute", "parent_traversal"])
+    def test_rejected_source_cleanup_refuses_traversing_manifest_install_path(
+        self, tmp_path, malicious_kind
+    ):
+        workspace, skill = self._setup_workspace(tmp_path)
+        secret = tmp_path / "source-secret"
+        secret.write_text("outside")
+        (skill / "escape.txt").symlink_to(secret)
+        skills_dir = tmp_path / "target"
+        skills_dir.mkdir()
+        manifest = skills_dir / ".workspace_manifest"
+        external = tmp_path / "external-owned-by-foreign"
+        external.mkdir()
+        (external / "KEEP.txt").write_text("do not mutate")
+        external_inode = external.lstat().st_ino
+        install_path = (
+            str(external)
+            if malicious_kind == "absolute"
+            else "../external-owned-by-foreign"
+        )
+        record = {
+            "hash": "attacker-controlled",
+            "install_path": install_path,
+            "provenance": {
+                "kind": "workspace",
+                "source_root": str(workspace.resolve()),
+            },
+        }
+        manifest.write_text(
+            "safe-skill:" + json.dumps(record, separators=(",", ":")) + "\n"
+        )
+
+        result = sync_skills(
+            quiet=True,
+            source_dir=workspace,
+            target_dir=skills_dir,
+            manifest_file=manifest,
+        )
+
+        assert result["rejected"] == ["safe-skill"]
+        assert result["removed"] == 0
+        assert result["cleaned"] == []
+        assert external.lstat().st_ino == external_inode
+        assert (external / "KEEP.txt").read_text() == "do not mutate"
+        records = skills_sync_module._read_manifest_records(manifest)
+        assert records["safe-skill"]["install_path"] == install_path
 
 
 # ===== GAP-1: _dir_hash MUST NOT be called on bad sources =====

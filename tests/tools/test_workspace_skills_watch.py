@@ -56,6 +56,39 @@ class TestRunOnceStartup:
         assert result["copied"] == 1
         assert result["total_source"] == 1
 
+    def test_run_once_surfaces_quiet_copy_errors(self, tmp_path, monkeypatch):
+        source = tmp_path / "workspace" / "skills"
+        hermes_home = tmp_path / "hermes"
+        source.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_WORKSPACE_SKILLS", str(source))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(
+            watch,
+            "sync_skills",
+            Mock(
+                return_value={
+                    "copied": [],
+                    "updated": [],
+                    "removed": 0,
+                    "skipped": 0,
+                    "user_modified": [],
+                    "validation_errors": [],
+                    "copy_errors": [
+                        {"skill": "image-gen", "operation": "update", "error": "denied"}
+                    ],
+                    "total_bundled": 1,
+                }
+            ),
+        )
+
+        result = watch.run_once("startup")
+
+        assert result["copy_errors"] == [
+            {"skill": "image-gen", "operation": "update", "error": "denied"}
+        ]
+        assert result["copy_error_count"] == 1
+        assert result["error"] == "skills sync completed with 1 copy error(s)"
+
 
 class TestDebounce:
     def test_five_events_within_quiet_window_trigger_one_sync(self, tmp_path):
@@ -121,6 +154,27 @@ class TestLockExclusion:
 
         assert not lock_file.exists()
 
+    def test_release_restores_replacement_created_between_check_and_rename(
+        self, tmp_path, monkeypatch
+    ):
+        lock_file = tmp_path / ".workspace_sync.lock"
+        assert watch.acquire_lock(lock_file) is True
+        foreign = b"424242"
+        foreign_inode = {}
+
+        def replace_lock(purpose):
+            if purpose != "release":
+                return
+            lock_file.unlink()
+            lock_file.write_bytes(foreign)
+            foreign_inode["value"] = lock_file.lstat().st_ino
+
+        monkeypatch.setattr(watch, "_lock_mutation_barrier", replace_lock)
+        watch.release_lock(lock_file)
+
+        assert lock_file.read_bytes() == foreign
+        assert lock_file.lstat().st_ino == foreign_inode["value"]
+
 
 class TestStaleLockRecovery:
     def test_stale_dead_pid_lock_is_recovered(self, tmp_path, monkeypatch):
@@ -135,6 +189,30 @@ class TestStaleLockRecovery:
             assert lock_file.read_text(encoding="utf-8") == str(os.getpid())
         finally:
             watch.release_lock(lock_file)
+
+    def test_stale_recovery_restores_replacement_created_before_rename(
+        self, tmp_path, monkeypatch
+    ):
+        lock_file = tmp_path / ".workspace_sync.lock"
+        lock_file.write_text("999999", encoding="utf-8")
+        old = time.time() - watch.STALE_LOCK_SECONDS - 5
+        os.utime(lock_file, (old, old))
+        foreign = b"31337"
+        foreign_inode = {}
+        monkeypatch.setattr(watch, "_pid_exists", lambda pid: False)
+
+        def replace_lock(purpose):
+            if purpose != "stale":
+                return
+            lock_file.unlink()
+            lock_file.write_bytes(foreign)
+            foreign_inode["value"] = lock_file.lstat().st_ino
+
+        monkeypatch.setattr(watch, "_lock_mutation_barrier", replace_lock)
+
+        assert watch.acquire_lock(lock_file) is False
+        assert lock_file.read_bytes() == foreign
+        assert lock_file.lstat().st_ino == foreign_inode["value"]
 
 
 class TestIgnoreFilter:

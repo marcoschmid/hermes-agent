@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import signal
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Callable
 
-from tools.skills_sync import sync_skills
+from tools.skills_sync import _rename_noreplace, sync_skills
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -27,6 +28,8 @@ STALE_LOCK_SECONDS = 10 * 60
 IGNORED_NAMES = {".DS_Store"}
 IGNORED_DIRS = {".git", ".github", "__pycache__"}
 IGNORED_SUFFIXES = (".swp", ".swo", ".tmp", "~")
+_owned_locks: dict[str, tuple[int, int, bytes]] = {}
+_owned_locks_guard = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,58 @@ def _lock_is_stale(lock_file: Path) -> bool:
     return pid is None or not _pid_exists(pid)
 
 
+def _lock_snapshot(lock_file: Path) -> tuple[int, int, bytes] | None:
+    """Read a stable lock identity and payload, or fail closed on a race."""
+    try:
+        before = lock_file.lstat()
+        payload = lock_file.read_bytes()
+        after = lock_file.lstat()
+    except OSError:
+        return None
+    before_identity = (before.st_dev, before.st_ino)
+    if before_identity != (after.st_dev, after.st_ino):
+        return None
+    return (*before_identity, payload)
+
+
+def _unique_quarantine(lock_file: Path, purpose: str) -> Path:
+    fd, name = tempfile.mkstemp(
+        dir=str(lock_file.parent),
+        prefix=f".{lock_file.name}.{purpose}-retained-",
+    )
+    os.close(fd)
+    os.unlink(name)
+    return Path(name)
+
+
+def _lock_mutation_barrier(_purpose: str) -> None:
+    """Test seam immediately between lock ownership check and rename."""
+    return None
+
+
+def _quarantine_lock_if_owned(
+    lock_file: Path,
+    expected: tuple[int, int, bytes],
+    purpose: str,
+) -> bool:
+    """Move an exact lock to retained quarantine without deleting a raced owner."""
+    quarantine = _unique_quarantine(lock_file, purpose)
+    _lock_mutation_barrier(purpose)
+    try:
+        _rename_noreplace(lock_file, quarantine)
+    except (FileNotFoundError, FileExistsError):
+        return False
+    observed = _lock_snapshot(quarantine)
+    if observed == expected:
+        return True
+    if not os.path.lexists(lock_file):
+        try:
+            _rename_noreplace(quarantine, lock_file)
+        except OSError:
+            logger.error("Retained raced lock at %s", quarantine, exc_info=True)
+    return False
+
+
 def acquire_lock(lock_file: Path | None = None) -> bool:
     """Acquire the inter-process sync lock.
 
@@ -106,28 +161,45 @@ def acquire_lock(lock_file: Path | None = None) -> bool:
                 handle.write(str(os.getpid()))
                 handle.flush()
                 os.fsync(handle.fileno())
+                created_stat = os.fstat(handle.fileno())
+            owned = _lock_snapshot(active_lock)
+            expected_payload = str(os.getpid()).encode("utf-8")
+            if owned != (created_stat.st_dev, created_stat.st_ino, expected_payload):
+                return False
+            with _owned_locks_guard:
+                _owned_locks[str(active_lock)] = owned
             return True
         except FileExistsError:
             if not _lock_is_stale(active_lock):
                 return False
-            try:
-                active_lock.unlink()
-                logger.warning("Recovered stale workspace sync lock: %s", active_lock)
-            except FileNotFoundError:
+            stale = _lock_snapshot(active_lock)
+            if stale is None:
                 continue
+            try:
+                stale_pid = int(stale[2].decode("utf-8").strip())
+            except (UnicodeDecodeError, ValueError):
+                stale_pid = None
+            try:
+                age = time.time() - active_lock.lstat().st_mtime
             except OSError:
+                continue
+            if age <= STALE_LOCK_SECONDS or (
+                stale_pid is not None and _pid_exists(stale_pid)
+            ):
                 return False
+            if _quarantine_lock_if_owned(active_lock, stale, "stale"):
+                logger.warning("Recovered stale workspace sync lock: %s", active_lock)
+                continue
+            return False
 
 
 def release_lock(lock_file: Path | None = None) -> None:
     active_lock = Path(lock_file) if lock_file is not None else resolve_config().lock_file
-    pid = _read_lock_pid(active_lock)
-    if pid not in (None, os.getpid()):
+    with _owned_locks_guard:
+        owned = _owned_locks.pop(str(active_lock), None)
+    if owned is None:
         return
-    try:
-        active_lock.unlink()
-    except FileNotFoundError:
-        pass
+    _quarantine_lock_if_owned(active_lock, owned, "release")
 
 
 def _count(value: Any) -> int:
@@ -191,8 +263,12 @@ def run_once(reason: str, event_count: int = 0, config: WatchConfig | None = Non
         "skipped": _count(result.get("skipped")),
         "user_modified": _count(result.get("user_modified")),
         "validation_errors": _count(result.get("validation_errors")),
+        "copy_errors": result.get("copy_errors", []),
+        "copy_error_count": _count(result.get("copy_errors")),
         "total_source": result.get("total_source", result.get("total_bundled", 0)),
     }
+    if payload["copy_error_count"]:
+        error = f"skills sync completed with {payload['copy_error_count']} copy error(s)"
     if error:
         payload["error"] = error
 
