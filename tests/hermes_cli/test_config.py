@@ -25,6 +25,33 @@ from hermes_cli.config import (
 )
 
 
+@pytest.fixture
+def setgid_capable_tmp_path(tmp_path):
+    """Bind ``tmp_path`` to a group the test process may mark setgid.
+
+    macOS clears the setgid bit when a directory's group is not one of the
+    caller's groups.  The clean-env test runner can create ``tmp_path`` with
+    group ``wheel``; use an fd-bound, no-follow group change so this test
+    exercises the configured mode instead of pytest's temporary-root group.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    dir_fd = os.open(tmp_path, flags)
+    try:
+        opened = os.fstat(dir_fd)
+        current = os.stat(tmp_path, follow_symlinks=False)
+        assert stat.S_ISDIR(opened.st_mode)
+        assert (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
+        try:
+            os.fchown(dir_fd, -1, os.getegid())
+        except PermissionError as exc:
+            pytest.skip(f"cannot assign tmp_path to the current egid: {exc}")
+        assert os.fstat(dir_fd).st_gid == os.getegid()
+    finally:
+        os.close(dir_fd)
+    return tmp_path
+
+
 class TestGetHermesHome:
     def test_default_path(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -62,7 +89,10 @@ class TestEnsureHermesHome:
             assert soul_path.read_text(encoding="utf-8") == "custom soul"
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits not enforced")
-    def test_configured_mode_applies_to_root_and_skills(self, tmp_path, monkeypatch):
+    def test_configured_mode_applies_to_root_and_skills(
+        self, setgid_capable_tmp_path, monkeypatch
+    ):
+        tmp_path = setgid_capable_tmp_path
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_HOME_MODE", "2770")
 
