@@ -47,6 +47,21 @@ def rebaseline_state(tmp_path: Path) -> dict[str, Path]:
     }
 
 
+@pytest.fixture
+def legacy_rebaseline_state(
+    rebaseline_state: dict[str, Path],
+) -> dict[str, Path]:
+    """Convert the synced v3 record to the exact historical v2 shape."""
+    state = rebaseline_state
+    record = skills_sync._read_manifest_records(state["manifest"])["web-audit"]
+    state["manifest"].write_text(
+        f"web-audit:{record['hash']}\n",
+        encoding="utf-8",
+    )
+    state["manifest"].chmod(0o600)
+    return state
+
+
 def test_request_schema_is_explicit_and_content_addressed() -> None:
     try:
         rebaseline = importlib.import_module("tools.workspace_skills_rebaseline")
@@ -57,6 +72,7 @@ def test_request_schema_is_explicit_and_content_addressed() -> None:
     assert rebaseline.REQUEST_FIELDS == {
         "schema_version",
         "skill_name",
+        "expected_install_path",
         "expected_source_hash",
         "expected_target_hash",
         "expected_manifest_hash",
@@ -77,14 +93,284 @@ def test_inspect_builds_exact_request_from_current_state(
 
     assert set(request) == rebaseline.REQUEST_FIELDS
     assert request == {
-        "schema_version": 2,
+        "schema_version": 3,
         "skill_name": "web-audit",
+        "expected_install_path": "audits/web-audit",
         "expected_source_hash": rebaseline._tree_digest(state["source_skill"]),
         "expected_target_hash": rebaseline._tree_digest(state["target_skill"]),
         "expected_manifest_hash": hashlib.sha256(
             state["manifest"].read_bytes()
         ).hexdigest(),
     }
+
+
+def test_legacy_v2_record_inspects_applies_and_migrates_only_requested_record(
+    legacy_rebaseline_state: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    state = legacy_rebaseline_state
+    legacy_hash = skills_sync._read_manifest_records(state["manifest"])[
+        "web-audit"
+    ]["hash"]
+    unrelated = {
+        "hash": "1" * 32,
+        "install_path": "foreign/unrelated",
+        "provenance": {
+            "kind": "workspace",
+            "source_root": "/different/workspace",
+        },
+    }
+    state["manifest"].write_text(
+        "web-audit:"
+        + legacy_hash
+        + "\n"
+        + "unrelated:"
+        + json.dumps(unrelated, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    state["manifest"].chmod(0o600)
+    manifest_before = state["manifest"].read_bytes()
+
+    request = rebaseline.inspect_request(
+        "web-audit",
+        source_root=state["source"],
+        target_root=state["target"],
+        manifest_file=state["manifest"],
+    )
+    assert request["expected_manifest_hash"] == hashlib.sha256(
+        manifest_before
+    ).hexdigest()
+    assert request["expected_install_path"] == "audits/web-audit"
+    request_file = tmp_path / "legacy-web-audit-rebaseline.json"
+    request_file.write_text(json.dumps(request), encoding="utf-8")
+    request_file.chmod(0o600)
+
+    result = rebaseline.apply_request(
+        request_file,
+        source_root=state["source"],
+        target_root=state["target"],
+        manifest_file=state["manifest"],
+    )
+
+    assert result["action"] == "rebaselined"
+    records = skills_sync._read_manifest_records(state["manifest"])
+    assert records["web-audit"] == {
+        "hash": skills_sync._dir_hash(state["source_skill"]),
+        "install_path": "audits/web-audit",
+        "provenance": {
+            "kind": "workspace",
+            "source_root": str(state["source"].resolve()),
+        },
+    }
+    assert records["unrelated"] == unrelated
+    assert rebaseline._tree_digest(state["target_skill"]) == rebaseline._tree_digest(
+        state["source_skill"]
+    )
+
+
+@pytest.mark.parametrize("changed", ["source", "target", "legacy_record"])
+def test_legacy_request_cas_rejects_changed_bound_state(
+    legacy_rebaseline_state: dict[str, Path],
+    tmp_path: Path,
+    changed: str,
+) -> None:
+    state = legacy_rebaseline_state
+    request = rebaseline.inspect_request(
+        "web-audit",
+        source_root=state["source"],
+        target_root=state["target"],
+        manifest_file=state["manifest"],
+    )
+    request_file = tmp_path / f"legacy-stale-{changed}.json"
+    request_file.write_text(json.dumps(request), encoding="utf-8")
+    request_file.chmod(0o600)
+
+    if changed == "source":
+        (state["source_skill"] / "SKILL.md").write_text(
+            "---\nname: web-audit\n---\n# changed source\n",
+            encoding="utf-8",
+        )
+    elif changed == "target":
+        (state["target_skill"] / "SKILL.md").write_text(
+            "---\nname: web-audit\n---\n# changed target\n",
+            encoding="utf-8",
+        )
+    else:
+        state["manifest"].write_text(
+            f"web-audit:{'0' * 32}\n",
+            encoding="utf-8",
+        )
+        state["manifest"].chmod(0o600)
+
+    target_before = rebaseline._tree_digest(state["target_skill"])
+    target_identity = state["target_skill"].lstat().st_ino
+    manifest_before = state["manifest"].read_bytes()
+    with pytest.raises(rebaseline.RebaselineError, match="stale request"):
+        rebaseline.apply_request(
+            request_file,
+            source_root=state["source"],
+            target_root=state["target"],
+            manifest_file=state["manifest"],
+        )
+
+    assert state["target_skill"].lstat().st_ino == target_identity
+    assert rebaseline._tree_digest(state["target_skill"]) == target_before
+    assert state["manifest"].read_bytes() == manifest_before
+
+
+def test_legacy_request_cas_rejects_joint_source_and_target_relocation(
+    legacy_rebaseline_state: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    state = legacy_rebaseline_state
+    request = rebaseline.inspect_request(
+        "web-audit",
+        source_root=state["source"],
+        target_root=state["target"],
+        manifest_file=state["manifest"],
+    )
+    request_file = tmp_path / "legacy-relocation.json"
+    request_file.write_text(json.dumps(request), encoding="utf-8")
+    request_file.chmod(0o600)
+
+    relocated_source = state["source"] / "relocated" / "web-audit"
+    relocated_target = state["target"] / "relocated" / "web-audit"
+    relocated_source.parent.mkdir()
+    relocated_target.parent.mkdir()
+    source_identity = state["source_skill"].lstat().st_ino
+    target_identity = state["target_skill"].lstat().st_ino
+    state["source_skill"].rename(relocated_source)
+    state["target_skill"].rename(relocated_target)
+    assert relocated_source.lstat().st_ino == source_identity
+    assert relocated_target.lstat().st_ino == target_identity
+
+    target_before = rebaseline._tree_digest(relocated_target)
+    manifest_before = state["manifest"].read_bytes()
+    with pytest.raises(
+        rebaseline.RebaselineError, match="stale request: install path changed"
+    ):
+        rebaseline.apply_request(
+            request_file,
+            source_root=state["source"],
+            target_root=state["target"],
+            manifest_file=state["manifest"],
+        )
+
+    assert relocated_target.lstat().st_ino == target_identity
+    assert rebaseline._tree_digest(relocated_target) == target_before
+    assert state["manifest"].read_bytes() == manifest_before
+    assert not (state["target"] / ".archive" / "rebaseline").exists()
+
+
+@pytest.mark.parametrize(
+    ("record", "expected_error"),
+    [
+        ({"hash": "not-an-md5"}, "manifest hash is invalid"),
+        ({"hash": "0" * 32, "install_path": None}, "install_path"),
+        (
+            {"hash": "0" * 32, "install_path": "audits/web-audit"},
+            "provenance",
+        ),
+        ({"hash": "0" * 32, "provenance": None}, "install_path"),
+        (
+            {
+                "hash": "0" * 32,
+                "provenance": {"kind": "workspace", "source_root": "/wrong"},
+            },
+            "install_path",
+        ),
+        (
+            {"hash": "0" * 32, "unexpected": "not-v2"},
+            "legacy manifest record",
+        ),
+    ],
+)
+def test_legacy_resolution_rejects_invalid_hash_and_partial_or_extended_records(
+    legacy_rebaseline_state: dict[str, Path],
+    record: dict[str, object],
+    expected_error: str,
+) -> None:
+    state = legacy_rebaseline_state
+    state["manifest"].write_text(
+        "web-audit:"
+        + json.dumps(record, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    state["manifest"].chmod(0o600)
+
+    with pytest.raises(rebaseline.RebaselineError, match=expected_error):
+        rebaseline.inspect_request(
+            "web-audit",
+            source_root=state["source"],
+            target_root=state["target"],
+            manifest_file=state["manifest"],
+        )
+
+
+@pytest.mark.parametrize("source_case", ["missing", "ambiguous"])
+def test_legacy_resolution_requires_one_unique_source_skill(
+    legacy_rebaseline_state: dict[str, Path],
+    source_case: str,
+) -> None:
+    state = legacy_rebaseline_state
+    if source_case == "missing":
+        (state["source_skill"] / "SKILL.md").unlink()
+    else:
+        duplicate = state["source"] / "duplicates" / "other-folder"
+        duplicate.mkdir(parents=True)
+        (duplicate / "SKILL.md").write_text(
+            "---\nname: web-audit\n---\n# Duplicate\n",
+            encoding="utf-8",
+        )
+
+    expected_error = (
+        "skill 'web-audit' is absent"
+        if source_case == "missing"
+        else "skill 'web-audit' is ambiguous"
+    )
+    with pytest.raises(rebaseline.RebaselineError, match=expected_error):
+        rebaseline.inspect_request(
+            "web-audit",
+            source_root=state["source"],
+            target_root=state["target"],
+            manifest_file=state["manifest"],
+        )
+
+
+def test_legacy_resolution_requires_exact_canonical_target(
+    legacy_rebaseline_state: dict[str, Path],
+) -> None:
+    state = legacy_rebaseline_state
+    relocated = state["target"] / "elsewhere" / "web-audit"
+    relocated.parent.mkdir()
+    state["target_skill"].rename(relocated)
+
+    with pytest.raises(
+        rebaseline.RebaselineError, match="legacy canonical target is unavailable"
+    ):
+        rebaseline.inspect_request(
+            "web-audit",
+            source_root=state["source"],
+            target_root=state["target"],
+            manifest_file=state["manifest"],
+        )
+
+
+def test_legacy_resolution_rejects_unsafe_canonical_target_tree(
+    legacy_rebaseline_state: dict[str, Path],
+) -> None:
+    state = legacy_rebaseline_state
+    (state["target_skill"] / "unsafe-link").symlink_to("SKILL.md")
+
+    with pytest.raises(rebaseline.RebaselineError, match="symlink"):
+        rebaseline.inspect_request(
+            "web-audit",
+            source_root=state["source"],
+            target_root=state["target"],
+            manifest_file=state["manifest"],
+        )
 
 
 @pytest.mark.parametrize(
@@ -432,7 +718,7 @@ def test_dirfd_tree_digest_rejects_root_mode_change_before_traversal(
         os.close(root_fd)
 
 
-def test_inspect_uses_schema_v2_sha256_tree_expectations(
+def test_inspect_uses_schema_v3_path_and_sha256_tree_expectations(
     rebaseline_state: dict[str, Path],
 ) -> None:
     state = rebaseline_state
@@ -444,7 +730,8 @@ def test_inspect_uses_schema_v2_sha256_tree_expectations(
         manifest_file=state["manifest"],
     )
 
-    assert request["schema_version"] == 2
+    assert request["schema_version"] == 3
+    assert request["expected_install_path"] == "audits/web-audit"
     assert request["expected_source_hash"] == rebaseline._tree_digest(
         state["source_skill"]
     )
@@ -785,6 +1072,69 @@ def test_apply_rejects_unknown_or_duplicate_request_fields(
         )
 
 
+@pytest.mark.parametrize("old_shape", ["actual-v2", "wrong-version-v2"])
+def test_apply_rejects_old_request_schema_fail_closed(
+    rebaseline_state: dict[str, Path],
+    tmp_path: Path,
+    old_shape: str,
+) -> None:
+    state = rebaseline_state
+    request_file, request = _request_file(state, tmp_path)
+    request["schema_version"] = 2
+    if old_shape == "actual-v2":
+        request.pop("expected_install_path")
+        expected_error = "request fields"
+    else:
+        expected_error = "request schema_version must be 3"
+    request_file.write_text(json.dumps(request), encoding="utf-8")
+
+    with pytest.raises(rebaseline.RebaselineError, match=expected_error):
+        rebaseline.apply_request(
+            request_file,
+            source_root=state["source"],
+            target_root=state["target"],
+            manifest_file=state["manifest"],
+        )
+
+
+@pytest.mark.parametrize(
+    "install_path",
+    [
+        None,
+        True,
+        "",
+        ".",
+        "..",
+        "../web-audit",
+        "/audits/web-audit",
+        "audits//web-audit",
+        "audits/./web-audit",
+        "audits/web-*",
+        "audits/web-audit\x00suffix",
+    ],
+)
+def test_apply_rejects_malformed_expected_install_path(
+    rebaseline_state: dict[str, Path],
+    tmp_path: Path,
+    install_path: object,
+) -> None:
+    state = rebaseline_state
+    request_file, request = _request_file(state, tmp_path)
+    request["expected_install_path"] = install_path
+    request_file.write_text(json.dumps(request), encoding="utf-8")
+
+    with pytest.raises(
+        rebaseline.RebaselineError,
+        match="request field 'expected_install_path'.*invalid",
+    ):
+        rebaseline.apply_request(
+            request_file,
+            source_root=state["source"],
+            target_root=state["target"],
+            manifest_file=state["manifest"],
+        )
+
+
 def test_apply_rejects_symlink_request_file(
     rebaseline_state: dict[str, Path],
     tmp_path: Path,
@@ -981,6 +1331,106 @@ def test_post_copy_hash_change_blocks_manifest_and_preserves_both_versions(
     )
     assert len(recoveries) == 1
     assert b"Web Audit v1" in (recoveries[0] / "SKILL.md").read_bytes()
+
+
+def test_post_copy_relocation_is_rejected_before_manifest_mutation(
+    legacy_rebaseline_state: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = legacy_rebaseline_state
+    request_file, _request = _request_file(state, tmp_path)
+    original_manifest = state["manifest"].read_bytes()
+    original_target = (state["target_skill"] / "SKILL.md").read_bytes()
+    original_target_identity = state["target_skill"].lstat().st_ino
+    relocated_source = state["source"] / "relocated" / "web-audit"
+    relocated_target = state["target"] / "relocated" / "web-audit"
+    relocated_source.parent.mkdir()
+    relocated_target.parent.mkdir()
+    barrier_state = {"manifest_update_reached": False}
+
+    def relocate_published_pair(_target: Path) -> None:
+        source_identity = state["source_skill"].lstat().st_ino
+        published_identity = state["target_skill"].lstat().st_ino
+        state["source_skill"].rename(relocated_source)
+        state["target_skill"].rename(relocated_target)
+        assert relocated_source.lstat().st_ino == source_identity
+        assert relocated_target.lstat().st_ino == published_identity
+
+    def record_manifest_update_reached(_manifest: Path) -> None:
+        barrier_state["manifest_update_reached"] = True
+
+    monkeypatch.setattr(
+        rebaseline,
+        "_post_copy_barrier",
+        relocate_published_pair,
+    )
+    monkeypatch.setattr(
+        rebaseline,
+        "_manifest_update_barrier",
+        record_manifest_update_reached,
+    )
+
+    with pytest.raises(rebaseline.RebaselineError) as error:
+        rebaseline.apply_request(
+            request_file,
+            source_root=state["source"],
+            target_root=state["target"],
+            manifest_file=state["manifest"],
+        )
+
+    assert "post-copy install path changed" in str(error.value)
+    assert barrier_state["manifest_update_reached"] is False
+    assert state["manifest"].read_bytes() == original_manifest
+    record = skills_sync._read_manifest_records(state["manifest"])["web-audit"]
+    assert set(record) == {"hash"}
+    assert state["target_skill"].lstat().st_ino == original_target_identity
+    assert (state["target_skill"] / "SKILL.md").read_bytes() == original_target
+
+
+def test_manifest_update_barrier_relocation_is_rejected_before_manifest_write(
+    legacy_rebaseline_state: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = legacy_rebaseline_state
+    request_file, _request = _request_file(state, tmp_path)
+    original_manifest = state["manifest"].read_bytes()
+    relocated_source = state["source"] / "relocated" / "web-audit"
+    relocated_target = state["target"] / "relocated" / "web-audit"
+    relocated_source.parent.mkdir()
+    relocated_target.parent.mkdir()
+    barrier_state = {"manifest_write_reached": False}
+    real_write_manifest = rebaseline._write_manifest
+
+    def relocate_published_pair(_manifest: Path) -> None:
+        state["source_skill"].rename(relocated_source)
+        state["target_skill"].rename(relocated_target)
+
+    def record_manifest_write(*args, **kwargs):
+        barrier_state["manifest_write_reached"] = True
+        return real_write_manifest(*args, **kwargs)
+
+    monkeypatch.setattr(
+        rebaseline,
+        "_manifest_update_barrier",
+        relocate_published_pair,
+    )
+    monkeypatch.setattr(rebaseline, "_write_manifest", record_manifest_write)
+
+    with pytest.raises(rebaseline.RebaselineError) as error:
+        rebaseline.apply_request(
+            request_file,
+            source_root=state["source"],
+            target_root=state["target"],
+            manifest_file=state["manifest"],
+        )
+
+    assert "post-copy install path changed" in str(error.value)
+    assert barrier_state["manifest_write_reached"] is False
+    assert state["manifest"].read_bytes() == original_manifest
+    record = skills_sync._read_manifest_records(state["manifest"])["web-audit"]
+    assert set(record) == {"hash"}
 
 
 def test_publish_validation_quarantine_is_excluded_from_runtime_discovery(

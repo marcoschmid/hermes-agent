@@ -33,12 +33,13 @@ from tools.skills_sync import (
 REQUEST_FIELDS = {
     "schema_version",
     "skill_name",
+    "expected_install_path",
     "expected_source_hash",
     "expected_target_hash",
     "expected_manifest_hash",
 }
 
-REQUEST_SCHEMA_VERSION = 2
+REQUEST_SCHEMA_VERSION = 3
 _SKILL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _MD5_RE = re.compile(r"[0-9a-f]{32}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -79,6 +80,7 @@ class _SkillState:
     target_identity: tuple[int, int]
     install_path: str
     recorded_manifest_hash: str
+    legacy_manifest_record: bool
     manifest: _ManifestSnapshot
 
 
@@ -461,6 +463,29 @@ def _resolve_install_path(raw: object, target_root: Path) -> tuple[str, Path]:
     return normalized, target_path
 
 
+def _validate_request_install_path(raw: object) -> str:
+    if not isinstance(raw, str) or not raw or "\x00" in raw:
+        raise RebaselineError(
+            "request field 'expected_install_path' has an invalid path"
+        )
+    pure = PurePosixPath(raw)
+    if (
+        pure.is_absolute()
+        or not pure.parts
+        or any(part in {"", ".", ".."} for part in pure.parts)
+        or any(char in raw for char in _GLOB_CHARS)
+    ):
+        raise RebaselineError(
+            "request field 'expected_install_path' has an invalid path"
+        )
+    normalized = "/".join(pure.parts)
+    if normalized != raw:
+        raise RebaselineError(
+            "request field 'expected_install_path' has an invalid path"
+        )
+    return normalized
+
+
 def _inspect_state(
     skill_name: str,
     *,
@@ -475,26 +500,46 @@ def _inspect_state(
     record = manifest.records.get(name)
     if not isinstance(record, dict):
         raise RebaselineError(f"skill {name!r} is not tracked by the manifest")
-    install_path, target_path = _resolve_install_path(
-        record.get("install_path"), target
-    )
-    provenance = record.get("provenance")
-    if not (
-        isinstance(provenance, dict)
-        and provenance.get("kind") == "workspace"
-        and provenance.get("source_root") == str(source)
-    ):
-        raise RebaselineError(f"manifest provenance does not own skill {name!r}")
     recorded_hash = record.get("hash")
     if not isinstance(recorded_hash, str) or not _MD5_RE.fullmatch(recorded_hash):
         raise RebaselineError(f"manifest hash is invalid for skill {name!r}")
 
-    source_path = _find_source_skill(name, source)
-    source_install_path = source_path.relative_to(source).as_posix()
-    if source_install_path != install_path:
-        raise RebaselineError(
-            f"manifest install_path does not match source for skill {name!r}"
+    has_install_path = "install_path" in record
+    has_provenance = "provenance" in record
+    legacy_manifest_record = not has_install_path and not has_provenance
+    if legacy_manifest_record:
+        if set(record) != {"hash"}:
+            raise RebaselineError(
+                f"legacy manifest record is malformed for skill {name!r}"
+            )
+        source_path = _find_source_skill(name, source)
+        source_install_path = source_path.relative_to(source).as_posix()
+        try:
+            install_path, target_path = _resolve_install_path(
+                source_install_path,
+                target,
+            )
+        except RebaselineError as exc:
+            raise RebaselineError(
+                f"legacy canonical target is unavailable or unsafe for skill {name!r}"
+            ) from exc
+    else:
+        install_path, target_path = _resolve_install_path(
+            record.get("install_path"), target
         )
+        provenance = record.get("provenance")
+        if not (
+            isinstance(provenance, dict)
+            and provenance.get("kind") == "workspace"
+            and provenance.get("source_root") == str(source)
+        ):
+            raise RebaselineError(f"manifest provenance does not own skill {name!r}")
+        source_path = _find_source_skill(name, source)
+        source_install_path = source_path.relative_to(source).as_posix()
+        if source_install_path != install_path:
+            raise RebaselineError(
+                f"manifest install_path does not match source for skill {name!r}"
+            )
     _assert_managed_tree_safe(source_path, source, "source skill")
     _assert_managed_tree_safe(target_path, target, "target skill")
     source_stat = source_path.lstat()
@@ -513,6 +558,7 @@ def _inspect_state(
         target_identity=(target_stat.st_dev, target_stat.st_ino),
         install_path=install_path,
         recorded_manifest_hash=recorded_hash,
+        legacy_manifest_record=legacy_manifest_record,
         manifest=manifest,
     )
 
@@ -544,6 +590,7 @@ def inspect_request(
     return {
         "schema_version": REQUEST_SCHEMA_VERSION,
         "skill_name": state.name,
+        "expected_install_path": state.install_path,
         "expected_source_hash": state.source_hash,
         "expected_target_hash": state.target_hash,
         "expected_manifest_hash": state.manifest.digest,
@@ -643,6 +690,9 @@ def _load_request(request_file: Path | str) -> dict[str, object]:
             f"request schema_version must be {REQUEST_SCHEMA_VERSION}"
         )
     request["skill_name"] = _validate_skill_name(request["skill_name"])
+    request["expected_install_path"] = _validate_request_install_path(
+        request["expected_install_path"]
+    )
     for field in (
         "expected_source_hash",
         "expected_target_hash",
@@ -655,6 +705,8 @@ def _load_request(request_file: Path | str) -> dict[str, object]:
 
 
 def _assert_request_matches(request: dict[str, object], state: _SkillState) -> None:
+    if request["expected_install_path"] != state.install_path:
+        raise RebaselineError("stale request: install path changed")
     if request["expected_source_hash"] != state.source_hash:
         raise RebaselineError("stale request: source hash changed")
     if request["expected_target_hash"] != state.target_hash:
@@ -666,6 +718,7 @@ def _assert_request_matches(request: dict[str, object], state: _SkillState) -> N
 def _assert_transaction_identity(initial: _SkillState, current: _SkillState) -> None:
     _assert_request_matches(
         {
+            "expected_install_path": initial.install_path,
             "expected_source_hash": initial.source_hash,
             "expected_target_hash": initial.target_hash,
             "expected_manifest_hash": initial.manifest.digest,
@@ -678,6 +731,36 @@ def _assert_transaction_identity(initial: _SkillState, current: _SkillState) -> 
         raise RebaselineError("stale request: target identity changed")
     if current.manifest.identity != initial.manifest.identity:
         raise RebaselineError("stale request: manifest identity changed")
+
+
+def _assert_post_copy_transaction_identity(
+    initial: _SkillState,
+    current: _SkillState,
+    installed_identity: tuple[int, int],
+) -> None:
+    if (
+        current.manifest.digest != initial.manifest.digest
+        or current.manifest.identity != initial.manifest.identity
+    ):
+        raise RebaselineError("manifest changed before update")
+    if current.install_path != initial.install_path:
+        raise RebaselineError("post-copy install path changed")
+    if current.legacy_manifest_record != initial.legacy_manifest_record:
+        raise RebaselineError("post-copy legacy manifest status changed")
+    if current.source_hash != initial.source_hash:
+        raise RebaselineError("source changed after target publication")
+    if current.source_manifest_hash != initial.source_manifest_hash:
+        raise RebaselineError("source manifest hash changed after target publication")
+    if current.source_identity != initial.source_identity:
+        raise RebaselineError("source identity changed after target publication")
+    if current.target_hash != initial.source_hash:
+        raise RebaselineError("post-copy target hash verification failed")
+    if current.target_manifest_hash != initial.source_manifest_hash:
+        raise RebaselineError("post-copy target manifest hash verification failed")
+    if current.target_identity != installed_identity:
+        raise RebaselineError(
+            "published target identity changed before manifest update"
+        )
 
 
 def _pre_replace_barrier(_target_path: Path) -> None:
@@ -1608,30 +1691,39 @@ def _apply_request_with_archive(
             target_root=initial.target_root,
             manifest_file=initial.manifest.path,
         )
-        if post_copy.source_hash != initial.source_hash:
-            raise RebaselineError("source changed after target publication")
-        if post_copy.source_identity != initial.source_identity:
-            raise RebaselineError("source identity changed after target publication")
-        if post_copy.target_hash != initial.source_hash:
-            raise RebaselineError("post-copy target hash verification failed")
-        if post_copy.target_manifest_hash != initial.source_manifest_hash:
-            raise RebaselineError("post-copy target manifest hash verification failed")
-        if post_copy.target_identity != installed_identity:
-            raise RebaselineError(
-                "published target identity changed before manifest update"
-            )
-        if (
-            post_copy.manifest.digest != initial.manifest.digest
-            or post_copy.manifest.identity != initial.manifest.identity
-        ):
-            raise RebaselineError("manifest changed before update")
+        _assert_post_copy_transaction_identity(
+            initial,
+            post_copy,
+            installed_identity,
+        )
 
         records = dict(initial.manifest.records)
-        updated_record = dict(records[initial.name])
-        updated_record["hash"] = initial.source_manifest_hash
+        if initial.legacy_manifest_record:
+            updated_record = {
+                "hash": initial.source_manifest_hash,
+                "install_path": initial.install_path,
+                "provenance": {
+                    "kind": "workspace",
+                    "source_root": str(initial.source_root),
+                },
+            }
+        else:
+            updated_record = dict(records[initial.name])
+            updated_record["hash"] = initial.source_manifest_hash
         records[initial.name] = updated_record
         published_manifest_bytes = _manifest_payload(records)
         _manifest_update_barrier(initial.manifest.path)
+        pre_manifest_update = _inspect_state(
+            initial.name,
+            source_root=initial.source_root,
+            target_root=initial.target_root,
+            manifest_file=initial.manifest.path,
+        )
+        _assert_post_copy_transaction_identity(
+            initial,
+            pre_manifest_update,
+            installed_identity,
+        )
         published_manifest_identity = _write_manifest(
             records,
             initial.manifest.path,
@@ -1646,8 +1738,8 @@ def _apply_request_with_archive(
         ):
             raise RebaselineError("manifest changed after publication")
         final_record = final_manifest.records.get(initial.name, {})
-        if final_record.get("hash") != initial.source_manifest_hash:
-            raise RebaselineError("manifest post-publication hash verification failed")
+        if final_record != updated_record:
+            raise RebaselineError("manifest post-publication record verification failed")
         _assert_archive_root_binding(archive)
         final_target_stat = initial.target_path.lstat()
         if (
