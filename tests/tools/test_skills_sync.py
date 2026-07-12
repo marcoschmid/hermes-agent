@@ -209,6 +209,28 @@ class TestDirHash:
         h = _dir_hash(tmp_path / "nope")
         assert isinstance(h, str)  # returns hash of empty content
 
+    def test_shared_ignore_predicate_covers_dot_tmp_for_hash_and_copy(self, tmp_path):
+        clean = tmp_path / "clean"
+        noisy = tmp_path / "noisy"
+        clean.mkdir()
+        noisy.mkdir()
+        (clean / "SKILL.md").write_text("same")
+        (noisy / "SKILL.md").write_text("same")
+        (noisy / ".tmp").write_text("ignored")
+        (noisy / "cache.tmp").mkdir()
+        (noisy / "cache.tmp" / "ignored.txt").write_text("ignored subtree")
+
+        assert skills_sync_module.is_sync_ignored_path(Path(".tmp")) is True
+        assert (
+            skills_sync_module.is_sync_ignored_path(Path("cache.tmp/ignored.txt"))
+            is True
+        )
+        assert skills_sync_module._copytree_ignore("", [".tmp", "cache.tmp"]) == {
+            ".tmp",
+            "cache.tmp",
+        }
+        assert _dir_hash(clean) == _dir_hash(noisy)
+
 
 class TestDiscoverBundledSkills:
     def test_finds_skills_with_skill_md(self, tmp_path):

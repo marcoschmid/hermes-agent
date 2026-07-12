@@ -38,9 +38,13 @@ pytestmark = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 
-def test_save_auth_store_writes_0o600_with_0o700_parent(tmp_path, monkeypatch):
-    """``_save_auth_store`` must land ``auth.json`` at 0o600 and parent at 0o700."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+def test_save_auth_store_writes_0o600_with_configured_exact_root(
+    tmp_path, monkeypatch
+):
+    """auth.json stays 0600 while exact HERMES_HOME may be group-shared."""
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_HOME_MODE", "2770")
     old_umask = os.umask(0o022)  # make the race observable if it regresses
     try:
         from hermes_cli import auth as auth_mod
@@ -60,8 +64,8 @@ def test_save_auth_store_writes_0o600_with_0o700_parent(tmp_path, monkeypatch):
     assert mode == 0o600, (
         f"auth.json mode 0o{mode:o} != 0o600 — TOCTOU race regressed"
     )
-    assert parent_mode == 0o700, (
-        f"auth.json parent dir mode 0o{parent_mode:o} != 0o700 — siblings can traverse"
+    assert parent_mode == 0o2770, (
+        f"auth.json exact HERMES_HOME mode 0o{parent_mode:o} != 0o2770"
     )
 
     # Content survived the rewrite
@@ -76,9 +80,12 @@ def test_save_auth_store_writes_0o600_with_0o700_parent(tmp_path, monkeypatch):
 
 def test_save_qwen_cli_tokens_writes_0o600_with_0o700_parent(tmp_path, monkeypatch):
     """``_save_qwen_cli_tokens`` must land the token file at 0o600 and parent at 0o700."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    hermes_home = tmp_path / "hermes-home"
+    user_home = tmp_path / "external-user-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_HOME_MODE", "2770")
     # The Qwen CLI auth path lives under $HOME/.qwen by default — isolate it.
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HOME", str(user_home))
     old_umask = os.umask(0o022)
     try:
         from hermes_cli import auth as auth_mod

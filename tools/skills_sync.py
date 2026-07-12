@@ -59,6 +59,17 @@ SKILLS_DIR = HERMES_HOME / "skills"
 MANIFEST_FILE = SKILLS_DIR / ".bundled_manifest"
 
 
+def is_sync_ignored_path(path: Path | str) -> bool:
+    """Return whether *path* is excluded by sync hash/copy/watch semantics."""
+    candidate = Path(path)
+    return any(
+        part in SYNC_IGNORED_DIRS
+        or part in SYNC_IGNORED_FILES
+        or any(part.endswith(suffix) for suffix in SYNC_IGNORED_SUFFIXES)
+        for part in candidate.parts
+    )
+
+
 def _get_bundled_dir() -> Path:
     """Locate the bundled skills/ directory.
 
@@ -516,14 +527,10 @@ def _dir_hash(directory: Path) -> str:
     """Compute a hash of all file contents in a directory for change detection."""
     hasher = hashlib.md5()
     for fpath in sorted(directory.rglob("*")):
+        rel = fpath.relative_to(directory)
+        if is_sync_ignored_path(rel):
+            continue
         if fpath.is_file():
-            rel = fpath.relative_to(directory)
-            if (
-                any(part in SYNC_IGNORED_DIRS for part in rel.parts)
-                or fpath.name in SYNC_IGNORED_FILES
-                or fpath.suffix in SYNC_IGNORED_SUFFIXES
-            ):
-                continue
             hasher.update(str(rel).encode("utf-8"))
             hasher.update(fpath.read_bytes())
     return hasher.hexdigest()
@@ -534,9 +541,7 @@ def _copytree_ignore(_directory: str, names: List[str]) -> set[str]:
     return {
         name
         for name in names
-        if name in SYNC_IGNORED_DIRS
-        or name in SYNC_IGNORED_FILES
-        or Path(name).suffix in SYNC_IGNORED_SUFFIXES
+        if is_sync_ignored_path(Path(name))
     }
 
 

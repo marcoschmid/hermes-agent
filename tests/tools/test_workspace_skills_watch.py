@@ -12,13 +12,19 @@ from unittest.mock import Mock
 import pytest
 
 from tools import workspace_skills_watch as watch
+from tools import skills_sync
 
 
-def _event(path: Path | str, dest_path: Path | str | None = None):
+def _event(
+    path: Path | str,
+    dest_path: Path | str | None = None,
+    *,
+    event_type: str = "modified",
+):
     return SimpleNamespace(
         src_path=str(path),
         dest_path=str(dest_path) if dest_path is not None else None,
-        event_type="modified",
+        event_type=event_type,
         is_directory=False,
     )
 
@@ -216,6 +222,25 @@ class TestStaleLockRecovery:
 
 
 class TestIgnoreFilter:
+    def test_event_ignore_policy_matches_sync_hash_policy(self):
+        assert watch.IGNORED_NAMES == skills_sync.SYNC_IGNORED_FILES
+        assert watch.IGNORED_DIRS == skills_sync.SYNC_IGNORED_DIRS
+        assert set(watch.IGNORED_SUFFIXES) == skills_sync.SYNC_IGNORED_SUFFIXES
+
+    @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            (".tmp", True),
+            ("file.tmp", True),
+            ("cache.tmp/child.txt", True),
+            ("node_modules/pkg/index.js", True),
+            ("managed/SKILL.md", False),
+        ],
+    )
+    def test_watcher_calls_shared_sync_ignore_predicate(self, path, expected):
+        assert watch.is_ignored_path(path) is expected
+        assert skills_sync.is_sync_ignored_path(Path(path)) is expected
+
     @pytest.mark.parametrize(
         "path",
         [
@@ -223,10 +248,11 @@ class TestIgnoreFilter:
             "file.swp",
             "file.swo",
             "file.tmp",
-            "file~",
             ".git/HEAD",
-            ".github/workflows/test.yml",
             "__pycache__/module.pyc",
+            ".pytest_cache/v/cache/nodeids",
+            "node_modules/pkg/index.js",
+            "test-results/report.json",
         ],
     )
     def test_ignored_events_do_not_schedule_sync(self, tmp_path, path):
@@ -240,6 +266,46 @@ class TestIgnoreFilter:
         handler.dispatch(_event(tmp_path / path))
 
         assert not synced.wait(0.15)
+
+    def test_move_ignored_to_ignored_does_not_schedule_sync(self, tmp_path):
+        handler = watch.DebouncedHandler()
+        handler.enqueue = Mock()
+
+        handler.dispatch(
+            _event(
+                tmp_path / "from.tmp",
+                tmp_path / "node_modules" / "to.js",
+                event_type="moved",
+            )
+        )
+
+        handler.enqueue.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("source", "destination"),
+        [
+            ("from.tmp", "managed/SKILL.md"),
+            ("managed/SKILL.md", "to.tmp"),
+        ],
+    )
+    def test_move_crossing_ignore_boundary_schedules_sync(
+        self,
+        tmp_path,
+        source,
+        destination,
+    ):
+        handler = watch.DebouncedHandler()
+        handler.enqueue = Mock()
+
+        handler.dispatch(
+            _event(
+                tmp_path / source,
+                tmp_path / destination,
+                event_type="moved",
+            )
+        )
+
+        handler.enqueue.assert_called_once_with()
 
 
 class TestSymlinkLoop:

@@ -12,11 +12,17 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Callable
 
-from tools.skills_sync import _rename_noreplace, sync_skills
+from tools.skills_sync import (
+    SYNC_IGNORED_DIRS,
+    SYNC_IGNORED_FILES,
+    SYNC_IGNORED_SUFFIXES,
+    _rename_noreplace,
+    is_sync_ignored_path,
+    sync_skills,
+)
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -25,9 +31,9 @@ logger = logging.getLogger(__name__)
 QUIET_WINDOW_SECONDS = 2.0
 MAX_BURST_SECONDS = 30.0
 STALE_LOCK_SECONDS = 10 * 60
-IGNORED_NAMES = {".DS_Store"}
-IGNORED_DIRS = {".git", ".github", "__pycache__"}
-IGNORED_SUFFIXES = (".swp", ".swo", ".tmp", "~")
+IGNORED_NAMES = SYNC_IGNORED_FILES
+IGNORED_DIRS = SYNC_IGNORED_DIRS
+IGNORED_SUFFIXES = tuple(sorted(SYNC_IGNORED_SUFFIXES))
 _owned_locks: dict[str, tuple[int, int, bytes]] = {}
 _owned_locks_guard = threading.Lock()
 
@@ -279,15 +285,7 @@ def run_once(reason: str, event_count: int = 0, config: WatchConfig | None = Non
 def is_ignored_path(path: str | None) -> bool:
     if not path:
         return False
-    candidate = Path(path)
-    name = candidate.name
-    if name in IGNORED_NAMES:
-        return True
-    if any(part in IGNORED_DIRS for part in candidate.parts):
-        return True
-    if any(fnmatch(name, f"*{suffix}") for suffix in IGNORED_SUFFIXES):
-        return True
-    return False
+    return is_sync_ignored_path(Path(path))
 
 
 class DebouncedHandler(FileSystemEventHandler):
@@ -309,8 +307,19 @@ class DebouncedHandler(FileSystemEventHandler):
         self._pending = False
 
     def dispatch(self, event: Any) -> None:
-        paths = [getattr(event, "src_path", None), getattr(event, "dest_path", None)]
-        if any(is_ignored_path(path) for path in paths):
+        source = getattr(event, "src_path", None)
+        destination = getattr(event, "dest_path", None)
+        if getattr(event, "event_type", None) == "moved":
+            # A move crossing the managed/ignored boundary changes the sync tree.
+            # Suppress only a fully specified ignored -> ignored move.
+            if (
+                source
+                and destination
+                and is_ignored_path(source)
+                and is_ignored_path(destination)
+            ):
+                return
+        elif source and is_ignored_path(source):
             return
         super().dispatch(event)
 

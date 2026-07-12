@@ -101,6 +101,27 @@ def get_hermes_home() -> Path:
     return Path.home() / ".hermes"
 
 
+def get_hermes_home_mode() -> int:
+    """Return the configured POSIX mode for the exact Hermes home directory.
+
+    ``HERMES_HOME_MODE`` accepts one to four octal digits, optionally prefixed
+    by lowercase ``0o``, so deployments can opt into group sharing or setgid
+    (for example ``2770``). Unset, empty, non-canonical, or out-of-range
+    values fail closed to owner-only ``0o700``.
+
+    Import-safe: this helper intentionally depends on stdlib and environment
+    access only so low-level credential writers can use it without creating
+    import cycles.
+    """
+    raw_mode = os.environ.get("HERMES_HOME_MODE", "").strip()
+    if not raw_mode:
+        return 0o700
+    digits = raw_mode[2:] if raw_mode.startswith("0o") else raw_mode
+    if not 1 <= len(digits) <= 4 or any(digit not in "01234567" for digit in digits):
+        return 0o700
+    return int(digits, 8)
+
+
 def get_default_hermes_root() -> Path:
     """Return the root Hermes directory for profile-level operations.
 
@@ -255,7 +276,12 @@ def display_hermes_home() -> str:
 
 
 def secure_parent_dir(path: Path) -> None:
-    """Chmod ``0o700`` on the parent directory of *path*, but only if safe.
+    """Secure the parent directory of *path*, but only if safe.
+
+    The exact resolved :func:`get_hermes_home` parent honors
+    :func:`get_hermes_home_mode`. Nested Hermes directories and external
+    credential directories remain owner-only ``0o700`` so a group-shared
+    Hermes root does not broaden access to secret stores.
 
     Refuses to chmod ``/`` or any top-level directory (resolved parent with
     fewer than 3 parts, i.e. ``/`` or any direct child like ``/usr``) to
@@ -268,8 +294,24 @@ def secure_parent_dir(path: Path) -> None:
     # Refuse root and its direct children (/usr, /home, /var, /tmp, …).
     if parent == Path("/") or len(parent.parts) < 3:
         return
+    configured_home = get_hermes_home()
     try:
-        os.chmod(parent, 0o700)
+        absolute_home = configured_home.absolute()
+        resolved_home = configured_home.resolve()
+    except (OSError, RuntimeError):
+        absolute_home = None
+        resolved_home = None
+    # A broader configured mode is safe only for a direct, absolute,
+    # canonical HERMES_HOME path. If the final component or any parent is a
+    # symlink/alias, absolute() and resolve() differ and we fail closed.
+    direct_home = (
+        configured_home.is_absolute()
+        and absolute_home == resolved_home
+        and parent == resolved_home
+    )
+    mode = get_hermes_home_mode() if direct_home else 0o700
+    try:
+        os.chmod(parent, mode)
     except OSError:
         pass
 

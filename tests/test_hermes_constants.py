@@ -70,6 +70,51 @@ class TestGetDefaultHermesRoot:
         assert get_default_hermes_root() == docker_root
 
 
+class TestGetHermesHomeMode:
+    """HERMES_HOME_MODE parsing is shared and fail-closed."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (None, 0o700),
+            ("", 0o700),
+            ("   ", 0o700),
+            ("0700", 0o700),
+            ("2770", 0o2770),
+            ("0o750", 0o750),
+            ("  2770  ", 0o2770),
+        ],
+    )
+    def test_resolves_unset_empty_and_valid_octal(self, monkeypatch, raw, expected):
+        if raw is None:
+            monkeypatch.delenv("HERMES_HOME_MODE", raising=False)
+        else:
+            monkeypatch.setenv("HERMES_HOME_MODE", raw)
+
+        assert hermes_constants.get_hermes_home_mode() == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "not-octal",
+            "0899",
+            "-1",
+            "-0",
+            "+700",
+            "+750",
+            "2_770",
+            "0O750",
+            "07 50",
+            "10000",
+            "00000",
+        ],
+    )
+    def test_invalid_or_out_of_range_values_fail_closed(self, monkeypatch, raw):
+        monkeypatch.setenv("HERMES_HOME_MODE", raw)
+
+        assert hermes_constants.get_hermes_home_mode() == 0o700
+
+
 class TestIsContainer:
     """Tests for is_container() — Docker/Podman detection."""
 
@@ -191,6 +236,50 @@ class TestSecureParentDir:
         assert len(called_with) == 1
         assert called_with[0] == (str(safe_dir), 0o700)
 
+    def test_exact_hermes_home_uses_configured_mode(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "home" / "user" / ".hermes"
+        hermes_home.mkdir(parents=True)
+        target = hermes_home / "auth.json"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_HOME_MODE", "2770")
+
+        called_with = []
+        monkeypatch.setattr(os, "chmod", lambda p, m: called_with.append((Path(p), m)))
+
+        secure_parent_dir(target)
+
+        assert called_with == [(hermes_home.resolve(), 0o2770)]
+
+    def test_nested_hermes_parent_stays_owner_only(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "home" / "user" / ".hermes"
+        nested = hermes_home / "auth"
+        nested.mkdir(parents=True)
+        target = nested / "token.json"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_HOME_MODE", "2770")
+
+        called_with = []
+        monkeypatch.setattr(os, "chmod", lambda p, m: called_with.append((Path(p), m)))
+
+        secure_parent_dir(target)
+
+        assert called_with == [(nested.resolve(), 0o700)]
+
+    def test_external_credential_parent_stays_owner_only(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "home" / "user" / ".hermes"
+        qwen_home = tmp_path / "external" / ".qwen"
+        hermes_home.mkdir(parents=True)
+        qwen_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_HOME_MODE", "2770")
+
+        called_with = []
+        monkeypatch.setattr(os, "chmod", lambda p, m: called_with.append((Path(p), m)))
+
+        secure_parent_dir(qwen_home / "oauth_creds.json")
+
+        assert called_with == [(qwen_home.resolve(), 0o700)]
+
     def test_root_dir_skipped(self, monkeypatch):
         """Parent resolving to / must NOT be chmod'd."""
         called_with = []
@@ -263,4 +352,38 @@ class TestSecureParentDir:
         assert len(called_with) == 1
         assert called_with[0] == (str(real_dir), 0o700)
 
+    def test_final_symlink_to_hermes_home_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        real_home = tmp_path / "real" / "user" / ".hermes"
+        real_home.mkdir(parents=True)
+        linked_home = tmp_path / "linked-hermes"
+        linked_home.symlink_to(real_home, target_is_directory=True)
+        monkeypatch.setenv("HERMES_HOME", str(linked_home))
+        monkeypatch.setenv("HERMES_HOME_MODE", "2770")
 
+        called_with = []
+        monkeypatch.setattr(os, "chmod", lambda p, m: called_with.append((Path(p), m)))
+
+        secure_parent_dir(linked_home / "auth.json")
+
+        assert called_with == [(real_home.resolve(), 0o700)]
+
+    def test_parent_symlink_to_hermes_home_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        real_parent = tmp_path / "real" / "user"
+        real_home = real_parent / ".hermes"
+        real_home.mkdir(parents=True)
+        linked_parent = tmp_path / "linked-user"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        linked_home = linked_parent / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(linked_home))
+        monkeypatch.setenv("HERMES_HOME_MODE", "2770")
+
+        called_with = []
+        monkeypatch.setattr(os, "chmod", lambda p, m: called_with.append((Path(p), m)))
+
+        secure_parent_dir(linked_home / "auth.json")
+
+        assert called_with == [(real_home.resolve(), 0o700)]

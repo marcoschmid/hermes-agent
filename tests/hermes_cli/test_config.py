@@ -1,6 +1,7 @@
 """Tests for hermes_cli configuration management."""
 
 import os
+import stat
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -59,6 +60,26 @@ class TestEnsureHermesHome:
             soul_path.write_text("custom soul", encoding="utf-8")
             ensure_hermes_home()
             assert soul_path.read_text(encoding="utf-8") == "custom soul"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits not enforced")
+    def test_configured_mode_applies_to_root_and_skills(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_HOME_MODE", "2770")
+
+        ensure_hermes_home()
+
+        assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o2770
+        assert stat.S_IMODE((tmp_path / "skills").stat().st_mode) == 0o2770
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits not enforced")
+    def test_invalid_mode_fails_closed_for_root_and_skills(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_HOME_MODE", "not-octal")
+
+        ensure_hermes_home()
+
+        assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
+        assert stat.S_IMODE((tmp_path / "skills").stat().st_mode) == 0o700
 
 
 class TestLoadConfigDefaults:
@@ -892,4 +913,3 @@ class TestEnvWriteDenylist:
         # But the write path still refuses to update it
         with pytest.raises(ValueError, match="denylist"):
             save_env_value("LD_PRELOAD", "/tmp/evil.so")
-
