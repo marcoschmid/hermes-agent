@@ -34,6 +34,24 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+# ── macOS temp relocation ───────────────────────────────────────────────────
+# On macOS the default TMPDIR resolves under ``/private/var/folders/...``, which
+# matches the ``/private/var/`` prefix in the file_tools sensitive-path write
+# guard (``tools/file_tools.py`` ``_SENSITIVE_PATH_PREFIXES``). That makes any
+# test writing into pytest's ``tmp_path`` fail with "Refusing to write to
+# sensitive system path" — but only on macOS; on Linux/CI ``tmp_path`` lives
+# under ``/tmp`` and is unaffected. Relocate the temp base to ``/tmp`` (which
+# resolves to ``/private/tmp``, NOT a guarded prefix) so ``tmp_path`` writes
+# succeed. Set before pytest's tmp_path_factory reads ``tempfile.gettempdir()``.
+if sys.platform == "darwin":
+    import tempfile
+
+    _SAFE_TMP = "/tmp/hermes-pytest"
+    os.makedirs(_SAFE_TMP, exist_ok=True)
+    os.environ["TMPDIR"] = _SAFE_TMP
+    tempfile.tempdir = None  # force re-read of TMPDIR on next gettempdir()
+
+
 # ── Per-file process isolation ──────────────────────────────────────────────
 # Tests run via ``scripts/run_tests_parallel.py``, which spawns a fresh
 # ``python -m pytest <file>`` subprocess per test file. Cross-file state
