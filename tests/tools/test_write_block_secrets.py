@@ -74,11 +74,11 @@ class TestWriteFileCwdGuard:
         fake.write_file.assert_called_once()
 
     @patch("tools.file_tools._get_file_ops")
-    def test_config_yaml_write_allowed(self, mock_ops, monkeypatch):
-        # config.yaml is intentionally agent-writable in this fork.
+    def test_config_yaml_write_denied(self, mock_ops, monkeypatch):
+        # config.yaml is a control-plane file and intentionally write-denied.
         fake = _fake_write_ops()
         mock_ops.return_value = fake
         monkeypatch.setenv("TERMINAL_CWD", str(get_hermes_home()))
         result = json.loads(write_file_tool("config.yaml", "model: gpt\n", task_id="w_cfg"))
-        assert "error" not in result
-        fake.write_file.assert_called_once()
+        assert "error" in result
+        fake.write_file.assert_not_called()

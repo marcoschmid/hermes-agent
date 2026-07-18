@@ -114,6 +114,7 @@ class TestRipgrepAlreadyExcludesHidden:
         subprocess.run(["which", "rg"], capture_output=True).returncode != 0,
         reason="ripgrep not installed",
     )
+    @pytest.mark.live_system_guard_bypass
     def test_rg_finds_visible_content(self, searchable_tree):
         """rg should find content in visible directories."""
         result = subprocess.run(

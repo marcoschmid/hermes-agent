@@ -49,7 +49,7 @@ class TestSearchExplicitSecretFileBlocked:
         result = json.loads(search_tool(pattern=".", path=path,
                                         target="content", task_id="f1_env"))
         assert "error" in result
-        assert "secret store" in result["error"]
+        assert "Defense-in-depth" in result["error"]
         assert "LEAKVALUE0001" not in json.dumps(result)
         fake.search.assert_not_called()
 

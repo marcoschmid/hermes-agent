@@ -41,7 +41,7 @@ class TestReadFileCwdGuard:
         monkeypatch.setenv("TERMINAL_CWD", str(get_hermes_home()))
         result = json.loads(read_file_tool("auth.json", task_id="f3_auth"))
         assert "error" in result
-        assert "secret store" in result["error"]
+        assert "Defense-in-depth" in result["error"]
         assert "cwdleak0001" not in json.dumps(result)
 
     @patch("tools.file_tools._get_file_ops")
@@ -50,7 +50,7 @@ class TestReadFileCwdGuard:
         monkeypatch.setenv("TERMINAL_CWD", str(get_hermes_home()))
         result = json.loads(read_file_tool(".env", task_id="f3_env"))
         assert "error" in result
-        assert "secret store" in result["error"]
+        assert "Defense-in-depth" in result["error"]
         assert "cwdleak0002" not in json.dumps(result)
 
     @patch("tools.file_tools._get_file_ops")
@@ -59,7 +59,7 @@ class TestReadFileCwdGuard:
         monkeypatch.setenv("TERMINAL_CWD", str(get_hermes_home()))
         result = json.loads(read_file_tool("mcp-tokens/srv.json", task_id="f3_tok"))
         assert "error" in result
-        assert "secret store" in result["error"]
+        assert "Defense-in-depth" in result["error"]
 
     @patch("tools.file_tools._get_file_ops")
     def test_absolute_secret_still_blocked(self, mock_ops, monkeypatch):
@@ -69,7 +69,7 @@ class TestReadFileCwdGuard:
             read_file_tool(str(get_hermes_home() / "auth.json"), task_id="f3_abs")
         )
         assert "error" in result
-        assert "secret store" in result["error"]
+        assert "Defense-in-depth" in result["error"]
 
     @patch("tools.file_tools._get_file_ops")
     def test_relative_normal_file_still_allowed(self, mock_ops, monkeypatch, tmp_path):

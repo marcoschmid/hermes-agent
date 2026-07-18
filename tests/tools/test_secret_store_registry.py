@@ -26,7 +26,7 @@ from tools.file_tools import search_tool, _read_tracker
 from tools.file_operations import SearchResult, SearchMatch
 
 
-SECRET_STORES = [
+READ_BLOCKED_STORES = [
     "auth.json",
     ".env",
     "mcp-tokens/some-server.json",
@@ -38,12 +38,13 @@ SECRET_STORES = [
     "weixin/accounts/acct123.json",
 ]
 
+SECRET_STORES = [*READ_BLOCKED_STORES, "config.yaml"]
+
 # Secret directory roots themselves must be write-denied (else a write at the
 # dir path on a fresh profile blocks future credential persistence).
-SECRET_DIR_ROOTS = ["mcp-tokens", "auth", "secrets", "weixin/accounts"]
+SECRET_DIR_ROOTS = ["mcp-tokens", "secrets", "weixin/accounts"]
 
 BENIGN_STORES = [
-    "config.yaml",
     "models_dev_cache.json",
     "channel_directory.json",
     "sticker_cache.json",
@@ -51,9 +52,11 @@ BENIGN_STORES = [
     "feishu_comment_rules.json",
 ]
 
+READABLE_STORES = ["config.yaml", *BENIGN_STORES]
+
 
 class TestSecretStoreRegistryRead:
-    @pytest.mark.parametrize("rel", SECRET_STORES)
+    @pytest.mark.parametrize("rel", READ_BLOCKED_STORES)
     def test_read_blocked(self, rel):
         path = str(get_hermes_home() / rel)
         assert get_read_block_error(path) is not None, rel
@@ -75,7 +78,7 @@ class TestSecretDirRootsWriteDenied:
 
 
 class TestSecretStoreRegistryAllowed:
-    @pytest.mark.parametrize("rel", BENIGN_STORES)
+    @pytest.mark.parametrize("rel", READABLE_STORES)
     def test_read_allowed(self, rel):
         path = str(get_hermes_home() / rel)
         assert get_read_block_error(path) is None, rel
